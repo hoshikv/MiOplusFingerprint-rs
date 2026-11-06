@@ -1,0 +1,22 @@
+[package]
+name = "mfp-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mfp_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mfp-daemon"
+path = "src/main.rs"
+
+[dependencies]
+binder = { package = "binder_ndk", version = "0.2" }
+async-trait = "0.1"
+lazy_static = "1"
+libc = "0.2"
+binder_ndk_sys = { path = "vendor/binder_ndk_sys" }
+
+[patch.crates-io]
+binder_ndk_sys = { path = "vendor/binder_ndk_sys" }

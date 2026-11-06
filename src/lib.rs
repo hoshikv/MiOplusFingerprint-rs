@@ -1,0 +1,91 @@
+pub mod fod;
+pub mod hal;
+pub mod log;
+pub mod service;
+pub mod touchfeature;
+
+#[path = "gen/android/hardware/biometrics/fingerprint/AcquiredInfo.rs"]
+pub mod AcquiredInfo;
+#[path = "gen/android/hardware/biometrics/common/AuthenticateReason.rs"]
+pub mod AuthenticateReason;
+#[path = "gen/android/hardware/biometrics/common/CommonProps.rs"]
+pub mod CommonProps;
+#[path = "gen/android/hardware/biometrics/common/ComponentInfo.rs"]
+pub mod ComponentInfo;
+#[path = "gen/android/hardware/biometrics/common/DisplayState.rs"]
+pub mod DisplayState;
+#[path = "gen/android/hardware/biometrics/fingerprint/Error.rs"]
+pub mod Error;
+#[path = "gen/android/hardware/biometrics/fingerprint/FingerprintSensorType.rs"]
+pub mod FingerprintSensorType;
+#[path = "gen/android/hardware/keymaster/HardwareAuthToken.rs"]
+pub mod HardwareAuthToken;
+#[path = "gen/android/hardware/keymaster/HardwareAuthenticatorType.rs"]
+pub mod HardwareAuthenticatorType;
+#[path = "gen/android/hardware/biometrics/common/ICancellationSignal.rs"]
+pub mod ICancellationSignal;
+#[path = "gen/android/hardware/biometrics/fingerprint/IFingerprint.rs"]
+pub mod IFingerprint;
+#[path = "gen/android/hardware/biometrics/fingerprint/ISession.rs"]
+pub mod ISession;
+#[path = "gen/android/hardware/biometrics/fingerprint/ISessionCallback.rs"]
+pub mod ISessionCallback;
+#[path = "gen/vendor/xiaomi/hardware/fingerprintextension/IXiaomiFingerprint.rs"]
+pub mod IXiaomiFingerprint;
+#[path = "gen/android/hardware/biometrics/common/OperationContext.rs"]
+pub mod OperationContext;
+#[path = "gen/android/hardware/biometrics/common/OperationReason.rs"]
+pub mod OperationReason;
+#[path = "gen/android/hardware/biometrics/fingerprint/PointerContext.rs"]
+pub mod PointerContext;
+#[path = "gen/android/hardware/keymaster/SecurityLevel.rs"]
+pub mod SecurityLevel;
+#[path = "gen/android/hardware/biometrics/fingerprint/SensorLocation.rs"]
+pub mod SensorLocation;
+#[path = "gen/android/hardware/biometrics/fingerprint/SensorProps.rs"]
+pub mod SensorProps;
+#[path = "gen/android/hardware/biometrics/fingerprint/SensorShape.rs"]
+pub mod SensorShape;
+#[path = "gen/android/hardware/biometrics/common/SensorStrength.rs"]
+pub mod SensorStrength;
+#[path = "gen/android/hardware/keymaster/Timestamp.rs"]
+pub mod Timestamp;
+#[path = "gen/android/hardware/biometrics/fingerprint/TouchDetectionParameters.rs"]
+pub mod TouchDetectionParameters;
+#[path = "gen/android/hardware/keymaster/VerificationToken.rs"]
+pub mod VerificationToken;
+#[path = "gen/android/hardware/biometrics/common/WakeReason.rs"]
+pub mod WakeReason;
+
+pub mod mangled {
+    pub use crate::AcquiredInfo::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_12_AcquiredInfo;
+    pub use crate::AuthenticateReason::mangled::_7_android_8_hardware_10_biometrics_6_common_18_AuthenticateReason;
+    pub use crate::AuthenticateReason::mangled::_7_android_8_hardware_10_biometrics_6_common_18_AuthenticateReason_3_Tag;
+    pub use crate::AuthenticateReason::mangled::_7_android_8_hardware_10_biometrics_6_common_18_AuthenticateReason_4_Face;
+    pub use crate::AuthenticateReason::mangled::_7_android_8_hardware_10_biometrics_6_common_18_AuthenticateReason_6_Vendor;
+    pub use crate::AuthenticateReason::mangled::_7_android_8_hardware_10_biometrics_6_common_18_AuthenticateReason_11_Fingerprint;
+    pub use crate::CommonProps::mangled::_7_android_8_hardware_10_biometrics_6_common_11_CommonProps;
+    pub use crate::ComponentInfo::mangled::_7_android_8_hardware_10_biometrics_6_common_13_ComponentInfo;
+    pub use crate::DisplayState::mangled::_7_android_8_hardware_10_biometrics_6_common_12_DisplayState;
+    pub use crate::Error::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_5_Error;
+    pub use crate::FingerprintSensorType::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_21_FingerprintSensorType;
+    pub use crate::HardwareAuthToken::mangled::_7_android_8_hardware_9_keymaster_17_HardwareAuthToken;
+    pub use crate::HardwareAuthenticatorType::mangled::_7_android_8_hardware_9_keymaster_25_HardwareAuthenticatorType;
+    pub use crate::ICancellationSignal::mangled::_7_android_8_hardware_10_biometrics_6_common_19_ICancellationSignal;
+    pub use crate::IFingerprint::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_12_IFingerprint;
+    pub use crate::ISession::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_8_ISession;
+    pub use crate::ISessionCallback::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_16_ISessionCallback;
+    pub use crate::IXiaomiFingerprint::mangled::_6_vendor_6_xiaomi_8_hardware_20_fingerprintextension_18_IXiaomiFingerprint;
+    pub use crate::OperationContext::mangled::_7_android_8_hardware_10_biometrics_6_common_16_OperationContext;
+    pub use crate::OperationReason::mangled::_7_android_8_hardware_10_biometrics_6_common_15_OperationReason;
+    pub use crate::PointerContext::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_14_PointerContext;
+    pub use crate::SecurityLevel::mangled::_7_android_8_hardware_9_keymaster_13_SecurityLevel;
+    pub use crate::SensorLocation::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_14_SensorLocation;
+    pub use crate::SensorProps::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_11_SensorProps;
+    pub use crate::SensorShape::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_11_SensorShape;
+    pub use crate::SensorStrength::mangled::_7_android_8_hardware_10_biometrics_6_common_14_SensorStrength;
+    pub use crate::Timestamp::mangled::_7_android_8_hardware_9_keymaster_9_Timestamp;
+    pub use crate::TouchDetectionParameters::mangled::_7_android_8_hardware_10_biometrics_11_fingerprint_24_TouchDetectionParameters;
+    pub use crate::VerificationToken::mangled::_7_android_8_hardware_9_keymaster_17_VerificationToken;
+    pub use crate::WakeReason::mangled::_7_android_8_hardware_10_biometrics_6_common_10_WakeReason;
+}

@@ -1,0 +1,21 @@
+# Build output
+/target/
+
+# Device and vendor artifacts - never commit these
+/libs/
+/orig/
+/ref/
+/work/
+
+# Local build configuration (contains machine-specific NDK paths)
+/.cargo/
+
+# Local editor and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
