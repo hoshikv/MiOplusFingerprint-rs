@@ -34,37 +34,192 @@ capabilities from the same vendor properties used by the stock daemon.
 `IFingerprint/default` is registered as a lazy service and made persistent.
 `IXiaomiFingerprint/default` is registered when a usable vendor HAL is loaded.
 
+## Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Android framework                                                    │
+│  FingerprintService · SystemUI / FOD UI · Xiaomi framework           │
+│    │ Binder: IFingerprint, ISession, ISessionCallback                │
+│    │ Binder: IXiaomiFingerprint                                      │
+└────┼─────────────────────────────────────────────────────────────────┘
+     │
+┌────▼─────────────────────────────────────────────────────────────────┐
+│ /odm/bin/hw/mfp-daemon (this project)                                │
+│                                                                      │
+│  main.rs ───── loads HAL, starts Daemon, registers Binder services   │
+│  service.rs ── AIDL state machine, worker queue, notifications       │
+│  fod.rs ────── display/touch/evdev monitors, FOD state, HBM          │
+│  touchfeature.rs ─ raw Binder client for TouchFeature                │
+│  hal.rs ────── legacy vendor HAL loader and function-table wrappers  │
+└───┬───────────────────────┬────────────────────────┬─────────────────┘
+    │ dlopen / dlsym        │ Binder                 │ read/ioctl
+┌───▼───────────────────┐ ┌─▼─────────────────────┐ ┌▼──────────────────┐
+│ libhardware.so        │ │ TouchFeature service  │ │ disp_feature      │
+│ fingerprint.<vendor>  │ │ setModeValue          │ │ touch sysfs       │
+│ legacy HMI, ABI 0x201 │ │                       │ │ evdev touch input │
+└───────────────────────┘ └───────────────────────┘ └───────────────────┘
+```
+
+Module dependency flow:
+
+```text
+main
+├── hal          load libhardware, resolve vendor fingerprint device
+└── service      Daemon, AIDL implementations, worker queue
+    ├── fod      FOD engine and hardware monitors
+    │   ├── hal
+    │   └── touchfeature
+    ├── hal
+    ├── touchfeature
+    └── mangled  generated AIDL types
+```
+
+The daemon is the only owner of the vendor fingerprint device. AIDL requests
+are converted into `Job` values and serialized through the `hal-worker` thread,
+so vendor calls and notifications never race. The FOD engine is independent of
+the AIDL session lifetime and keeps the screen-off touch/HBM path active.
+
 ## Repository layout
+
+Every tracked path is listed below. The local `.cargo/config.toml` is ignored
+and is created from `.cargo/config.toml.example`. Vendor libraries, firmware,
+decompiled output, device dumps, `target/`, `libs/`, `orig/`, `ref/`, and
+`work/` are not part of the repository.
 
 ```text
 .
-├── aidl/
-│   └── vendor/xiaomi/hardware/fingerprintextension/
-│       └── IXiaomiFingerprint.aidl
-├── src/
-│   ├── bin/
-│   │   ├── ext_cmd.rs           # Sends Xiaomi extCmd commands
-│   │   └── test_client.rs       # AIDL session/HAL smoke client
-│   ├── gen/                     # Generated Rust AIDL bindings
-│   │   ├── android/...
-│   │   └── vendor/xiaomi/...
-│   ├── fod.rs                   # FOD engine, display events, HBM, touch
-│   ├── hal.rs                   # Legacy vendor HAL loader and wrappers
-│   ├── lib.rs                   # Module graph and AIDL exports
-│   ├── log.rs                   # logcat helpers
-│   ├── main.rs                  # Process entry point and service registration
-│   ├── service.rs               # AIDL services, worker, session, notify, lockout
-│   └── touchfeature.rs          # Raw binder client for TouchFeature
-├── vendor/
-│   └── binder_ndk_sys/          # Patched binder NDK bindings
+├── .cargo
+│   └── config.toml.example
+├── aidl
+│   └── vendor
+│       └── xiaomi
+│           └── hardware
+│               └── fingerprintextension
+│                   └── IXiaomiFingerprint.aidl
+├── src
+│   ├── bin
+│   │   ├── ext_cmd.rs
+│   │   └── test_client.rs
+│   ├── gen
+│   │   ├── android
+│   │   │   └── hardware
+│   │   │       ├── biometrics
+│   │   │       │   ├── common
+│   │   │       │   │   ├── AuthenticateReason.rs
+│   │   │       │   │   ├── CommonProps.rs
+│   │   │       │   │   ├── ComponentInfo.rs
+│   │   │       │   │   ├── DisplayState.rs
+│   │   │       │   │   ├── ICancellationSignal.rs
+│   │   │       │   │   ├── OperationContext.rs
+│   │   │       │   │   ├── OperationReason.rs
+│   │   │       │   │   ├── SensorStrength.rs
+│   │   │       │   │   └── WakeReason.rs
+│   │   │       │   └── fingerprint
+│   │   │       │       ├── AcquiredInfo.rs
+│   │   │       │       ├── Error.rs
+│   │   │       │       ├── FingerprintSensorType.rs
+│   │   │       │       ├── IFingerprint.rs
+│   │   │       │       ├── ISession.rs
+│   │   │       │       ├── ISessionCallback.rs
+│   │   │       │       ├── PointerContext.rs
+│   │   │       │       ├── SensorLocation.rs
+│   │   │       │       ├── SensorProps.rs
+│   │   │       │       ├── SensorShape.rs
+│   │   │       │       └── TouchDetectionParameters.rs
+│   │   │       └── keymaster
+│   │   │           ├── HardwareAuthToken.rs
+│   │   │           ├── HardwareAuthenticatorType.rs
+│   │   │           ├── SecurityLevel.rs
+│   │   │           ├── Timestamp.rs
+│   │   │           └── VerificationToken.rs
+│   │   └── vendor
+│   │       └── xiaomi
+│   │           └── hardware
+│   │               └── fingerprintextension
+│   │                   └── IXiaomiFingerprint.rs
+│   ├── fod.rs
+│   ├── hal.rs
+│   ├── lib.rs
+│   ├── log.rs
+│   ├── main.rs
+│   ├── service.rs
+│   └── touchfeature.rs
+├── vendor
+│   └── binder_ndk_sys
+│       ├── src
+│       │   ├── include_cpp
+│       │   │   └── android
+│       │   │       ├── binder_auto_utils.h
+│       │   │       ├── binder_enums.h
+│       │   │       ├── binder_interface_utils.h
+│       │   │       ├── binder_internal_logging.h
+│       │   │       ├── binder_parcel_utils.h
+│       │   │       ├── binder_parcelable_utils.h
+│       │   │       └── binder_to_string.h
+│       │   ├── include_ndk
+│       │   │   └── android
+│       │   │       ├── binder_ibinder.h
+│       │   │       ├── binder_ibinder_jni.h
+│       │   │       ├── binder_parcel.h
+│       │   │       ├── binder_parcel_jni.h
+│       │   │       └── binder_status.h
+│       │   ├── include_platform
+│       │   │   └── android
+│       │   │       ├── binder_ibinder_platform.h
+│       │   │       ├── binder_libbinder.h
+│       │   │       ├── binder_manager.h
+│       │   │       ├── binder_parcel_platform.h
+│       │   │       ├── binder_process.h
+│       │   │       ├── binder_shell.h
+│       │   │       └── binder_stability.h
+│       │   ├── BinderBindings.hpp
+│       │   ├── lib.rs
+│       │   └── symbols.txt
+│       ├── Cargo.toml
+│       ├── Cargo.toml.orig
+│       └── build.rs
 ├── .gitignore
 ├── Cargo.lock
 ├── Cargo.toml
 └── README.md
 ```
 
-Vendor libraries, firmware, decompiled output, device dumps, and build artifacts
-are not part of the repository.
+Path responsibilities:
+
+| Path | Purpose |
+| --- | --- |
+| `aidl/vendor/xiaomi/hardware/fingerprintextension/IXiaomiFingerprint.aidl` | Xiaomi fingerprint extension interface |
+| `src/main.rs` | Process entry point, HAL load, service registration |
+| `src/lib.rs` | Module graph and generated AIDL re-exports |
+| `src/service.rs` | `IFingerprint` / `ISession` / `IXiaomiFingerprint`, worker queue, notifications, lockout |
+| `src/hal.rs` | Legacy vendor HAL loader, ABI slots, property helpers |
+| `src/fod.rs` | FOD state, display/brightness events, press pipeline, HBM |
+| `src/touchfeature.rs` | Raw Binder client for the vendor TouchFeature service |
+| `src/log.rs` | `logd!` / `logi!` / `logw!` / `loge!` macros |
+| `src/bin/ext_cmd.rs` | Xiaomi `extCmd` diagnostic client |
+| `src/bin/test_client.rs` | AIDL fingerprint session smoke client |
+| `src/gen/android/` | Checked-in AIDL-generated Android biometric/keymaster types |
+| `src/gen/vendor/xiaomi/hardware/fingerprintextension/` | Checked-in generated Xiaomi extension type |
+| `vendor/binder_ndk_sys/` | Patched Binder NDK bindings and target stub build |
+| `.cargo/config.toml.example` | Template for the machine-specific NDK linker path |
+| `Cargo.toml` | Crate manifest and local `binder_ndk_sys` patch |
+| `Cargo.lock` | Reproducible dependency versions |
+
+## AIDL binding
+
+The custom interface source is kept in
+`aidl/vendor/xiaomi/hardware/fingerprintextension/`. The Rust bindings in
+`src/gen/android` and `src/gen/vendor` are checked in because the repository
+does not run an AIDL generator at build time. `src/lib.rs` mounts each file with
+`#[path = ...]` and re-exports the mangled names through `pub mod mangled`.
+
+| Interface | Version | Hash |
+| --- | ---: | --- |
+| `android.hardware.biometrics.fingerprint.IFingerprint` | 3 | `637371b53fb7faf9bd43aa51b72c23852d6e6d96` |
+| `android.hardware.biometrics.fingerprint.ISession` | 3 | `637371b53fb7faf9bd43aa51b72c23852d6e6d96` |
+| `android.hardware.biometrics.fingerprint.ISessionCallback` | 3 | `637371b53fb7faf9bd43aa51b72c23852d6e6d96` |
+| `vendor.xiaomi.hardware.fingerprintextension.IXiaomiFingerprint` | 1 | `1ed45089cc89154986c15fc1c591d72e9ac7ae0d` |
 
 ## Process architecture
 
@@ -93,6 +248,26 @@ Runtime threads:
 
 The daemon keeps one global client callback and one active session identifier,
 matching the single-client model used by the vendor daemon.
+
+## Control flow
+
+1. `main` loads the vendor HAL, installs the legacy notification callback,
+   starts `Daemon`, and registers the AIDL services.
+2. `createSession` stores the client callback and session id, links a death
+   recipient, and calls the vendor `set_active_group` with
+   `/data/vendor_de/<userId>/fpdata`.
+3. Every session operation marks the session status and enqueues a `Job`.
+   `hal-worker` drains the queue and invokes one vendor function at a time.
+4. The vendor HAL reports results through `fingerprint_msg_t`. The callback
+   copies the message into an `mpsc` channel, `hal-notify` forwards it as
+   `Job::Notify`, and the worker translates it into an AIDL callback.
+5. Notification handling also updates global status, enrollment counts,
+   lockout state, and FOD/TouchFeature state.
+6. Xiaomi `extCmd` values `1..8` update `FodEngine` conditions. The touch
+   monitor gates FOD presses; a valid down selects HBM and drives the vendor
+   `extCmd` sequence, while an up or reset clears HBM and touch state.
+7. `close`, cancellation, client death, or a HAL error stops the active path
+   and resets the FOD engine.
 
 ## HAL integration
 
@@ -534,34 +709,38 @@ A successful authentication resets the counter. Vendor raw code `1040`
 (`VENDOR 40`) disables HBM and is not forwarded, matching the UI-ready timeout
 path.
 
-## Build
+## Building
 
 Requirements:
 
-- Rust with the `aarch64-linux-android` target.
-- Android NDK r28 or a compatible NDK.
-- `libclang` for bindgen.
+- Rust with Edition 2024 support (Rust 1.85 or newer).
+- Android NDK r28 or a compatible NDK with API 34 clang wrappers.
+- `libclang` for the vendored `bindgen` build.
+- `aarch64-linux-android` Rust target.
 - No vendor library is required at build time.
 
 The generated AIDL bindings are committed under `src/gen`.
 
-Example using NDK r28:
-
 ```bash
-export ANDROID_NDK_HOME=/path/to/android-ndk-r28
-export LIBCLANG_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib"
-export BINDGEN_EXTRA_CLANG_ARGS="--target=aarch64-linux-android34 --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+rustup target add aarch64-linux-android
+
+export ANDROID_NDK_ROOT="$HOME/android-ndk-r28"
+export LIBCLANG_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib"
+export BINDGEN_EXTRA_CLANG_ARGS="--target=aarch64-linux-android34 --sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 ```
 
-The local `.cargo/config.toml` contains a machine-specific NDK path and is
-ignored by git. Use the environment variables above or create your own local
-config.
+The linker is selected through `.cargo/config.toml`. Create it locally; the
+repository ignores the machine-specific file and ships
+`.cargo/config.toml.example`:
+
+```toml
+[target.aarch64-linux-android]
+linker = "/path/to/android-ndk-r28/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+```
 
 Compile:
 
 ```bash
-rustup target add aarch64-linux-android
 cargo build --release --target aarch64-linux-android
 ```
 
@@ -629,8 +808,11 @@ adb shell 'su -c "start mfp-daemon"'
 session API. `ext_cmd` sends Xiaomi extension commands:
 
 ```bash
-adb shell '/data/local/tmp/test_client'
-adb shell '/data/local/tmp/ext_cmd 4 1'
+adb push target/aarch64-linux-android/release/test_client /data/local/tmp/
+adb push target/aarch64-linux-android/release/ext_cmd /data/local/tmp/
+adb shell 'su -c "chmod 755 /data/local/tmp/test_client /data/local/tmp/ext_cmd"'
+adb shell 'su -c /data/local/tmp/test_client'
+adb shell 'su -c "/data/local/tmp/ext_cmd 4 1"'
 ```
 
 `test_client` replaces the daemon's global session and callback. Do not run it

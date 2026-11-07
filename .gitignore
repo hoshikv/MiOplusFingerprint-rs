@@ -8,7 +8,7 @@
 /work/
 
 # Local build configuration (contains machine-specific NDK paths)
-/.cargo/
+/.cargo/config.toml
 
 # Local editor and OS files
 .idea/
