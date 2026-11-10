@@ -11,14 +11,13 @@ pub const INFO: i32 = 4;
 pub const DEBUG: i32 = 3;
 
 pub fn log(prio: i32, msg: &str) {
-    let tag = c"mfp-daemon";
-    let fmt = c"%s";
-    match CString::new(msg) {
+    let tag = c"OplusMiFP";
+    match CString::new(format!("hoshikv | ~logs~ {msg}")) {
         Ok(msg) => unsafe {
-            __android_log_print(prio, tag.as_ptr(), fmt.as_ptr(), msg.as_ptr());
+            __android_log_print(prio, tag.as_ptr(), c"%s".as_ptr(), msg.as_ptr());
         },
         Err(_) => unsafe {
-            __android_log_print(prio, tag.as_ptr(), c"mfp-daemon: message contained NUL".as_ptr());
+            __android_log_print(prio, tag.as_ptr(), c"%s".as_ptr(), c"hoshikv | ~logs~ bad-text".as_ptr());
         },
     }
 }

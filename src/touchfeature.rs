@@ -45,12 +45,12 @@ fn set_mode_value(touch_id: i32, mode: i32, value: i32) -> bool {
     let name = CString::new(SERVICE).expect("static service name");
     let binder = unsafe { sys::AServiceManager_getService(name.as_ptr()) };
     if binder.is_null() {
-        logw!("TouchFeature service {SERVICE} unavailable");
+        logw!("touchfeature=unavailable service={SERVICE}");
         return false;
     }
     let clazz = class();
     if clazz.is_null() {
-        logw!("TouchFeature class definition failed");
+        logw!("touchfeature=error stage=class");
         unsafe { sys::AIBinder_decStrong(binder) };
         return false;
     }
@@ -59,14 +59,14 @@ fn set_mode_value(touch_id: i32, mode: i32, value: i32) -> bool {
     let mut input = ptr::null_mut();
     let status = unsafe { sys::AIBinder_prepareTransaction(binder, &mut input) };
     if status != 0 || input.is_null() {
-        logw!("TouchFeature prepareTransaction failed: {status}");
+        logw!("touchfeature=error stage=prepare rc={status}");
         unsafe { sys::AIBinder_decStrong(binder) };
         return false;
     }
     for word in [touch_id, mode, value] {
         let status = unsafe { sys::AParcel_writeInt32(input, word) };
         if status != 0 {
-            logw!("TouchFeature writeInt32({word}) failed: {status}");
+            logw!("touchfeature=error stage=word word={word} rc={status}");
             unsafe {
                 sys::AParcel_delete(input);
                 sys::AIBinder_decStrong(binder);
@@ -80,9 +80,9 @@ fn set_mode_value(touch_id: i32, mode: i32, value: i32) -> bool {
         unsafe { sys::AIBinder_transact(binder, TX_SET_MODE_VALUE, &mut input, &mut output, 0) };
     let ok = status == 0;
     if !ok {
-        logw!("TouchFeature setModeValue({touch_id}, {mode}, {value}) transact failed: {status}");
+        logw!("touchfeature=transact-error id={touch_id} mode={mode} val={value} rc={status}");
     } else {
-        logd!("TouchFeature setModeValue({touch_id}, {mode}, {value})");
+        logd!("touchfeature=transact id={touch_id} mode={mode} val={value}");
     }
     unsafe {
         if !output.is_null() {

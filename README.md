@@ -773,7 +773,7 @@ Verify registration and logs:
 
 ```bash
 adb shell 'service list | grep -E "fingerprint.IFingerprint|IXiaomiFingerprint"'
-adb logcat -s mfp-daemon
+adb logcat -s OplusMiFP
 ```
 
 Restore the stock daemon:

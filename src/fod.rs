@@ -86,14 +86,14 @@ impl FodEngine {
         let enabled =
             hal::get_prop("ro.hardware.fp.fod.touch.ctl.version").as_deref() == Some("2.0");
         if !enabled {
-            logi!("FodEngine disabled: ro.hardware.fp.fod.touch.ctl.version != 2.0");
+            logi!("fod=disabled reason=prop");
             return Arc::new(Self::new(enabled, hal, None));
         }
 
         let hbm_file = match open_disp_feature() {
             Ok(file) => Some(Arc::new(file)),
             Err(e) => {
-                loge!("FodEngine open {DISP_FEATURE} failed: {e}");
+                loge!("display=open-error node={DISP_FEATURE} err={e}");
                 None
             }
         };
@@ -120,7 +120,7 @@ impl FodEngine {
             "persist.vendor.sys.fp.fp_ocp_control",
             if enabled { "true" } else { "false" },
         );
-        logi!("handlerCloudUpdateOcpControl: ocp control function is {enabled}");
+        logi!("cfg=ocp enabled={enabled}");
         self.hal_ext_cmd(11, enabled as u32);
     }
 
@@ -138,7 +138,7 @@ impl FodEngine {
                 .is_some_and(|first| first != b'0');
             let enable = enabled && (fod || fod_c || !side_unlock);
             self.anti_mistouch_enable.store(enable, Ordering::SeqCst);
-            logi!("handlerCloudUpdateAntiMistouch: enabled={enable}");
+            logi!("cfg=anti-mistouch enabled={enable}");
             self.hal_ext_cmd(14, enable as u32);
         } else if param & 1 != 0 {
             let threshold = ((param >> 4) & 0xf) as i32;
@@ -148,7 +148,7 @@ impl FodEngine {
                 "persist.vendor.sys.fp.valid_times_per_screenlock",
                 &threshold.to_string(),
             );
-            logi!("handlerCloudUpdateAntiMistouch: threshold={threshold}");
+            logi!("cfg=anti-mistouch-threshold val={threshold}");
         }
     }
 
@@ -163,8 +163,8 @@ impl FodEngine {
         self.set_local_hbm(HBM_ON_STATE_1);
         self.mistouch_reported.store(true, Ordering::SeqCst);
         let count = self.anti_mistouch_count.fetch_add(1, Ordering::SeqCst) + 1;
-        logi!("anti mistouch enabled, report mistouch (vendor {MISTOUCH_VENDOR_CODE})");
-        logi!("mistouch count is add up to = {count}");
+        logi!("anti-mistouch=report vendor={MISTOUCH_VENDOR_CODE}");
+        logi!("anti-mistouch-count val={count}");
     }
 
     pub fn take_mistouch_reported(&self) -> bool {
@@ -177,7 +177,7 @@ impl FodEngine {
 
     pub fn handle_ui_ready_timeout(&self) {
         self.set_local_hbm(HBM_OFF);
-        logi!("UI Ready timeout: onAcquired(7) ({UI_READY_TIMEOUT_VENDOR_CODE})");
+        logi!("ui-ready=timeout code={UI_READY_TIMEOUT_VENDOR_CODE}");
     }
 
     pub fn on_ext_cmd(&self, cmd: u32, param: u32) {
@@ -186,7 +186,7 @@ impl FodEngine {
         }
         match cmd {
             1 => {
-                logd!("FodEngine condition cmd=1 gxzwAnim={param}");
+                logd!("cond id=anim val={param}");
                 self.state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -194,7 +194,7 @@ impl FodEngine {
                 self.check_fod_touch_status();
             }
             2 => {
-                logd!("FodEngine condition cmd=2 colorfade={param}");
+                logd!("cond id=colorfade val={param}");
                 self.state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -202,7 +202,7 @@ impl FodEngine {
                 self.check_fod_touch_status();
             }
             5 => {
-                logd!("FodEngine condition cmd=5 lockout={param}");
+                logd!("cond id=lockout val={param}");
                 self.state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -210,7 +210,7 @@ impl FodEngine {
                 self.check_fod_touch_status();
             }
             3 => {
-                logd!("FodEngine power mode {param}");
+                logd!("cond id=power val={param}");
                 self.check_fod_touch_status_pre_power(param);
                 self.state
                     .lock()
@@ -226,7 +226,7 @@ impl FodEngine {
                     state.hal_state = param;
                     previous
                 };
-                logi!("FodEngine hal state {previous} -> {param}");
+                logi!("hal prev={previous} next={param}");
                 match param {
                     1 | 3 => {
                         if self.hbm_on() {
@@ -242,10 +242,10 @@ impl FodEngine {
                 self.check_fod_touch_status();
             }
             6 | 7 | 8 => {
-                logd!("FodEngine condition cmd={cmd} param={param}");
+                logd!("cond id={cmd} val={param}");
             }
             _ => {
-                logw!("unknown FodEngine condition cmd={cmd} param={param}");
+                logw!("cond id={cmd} val={param} result=unknown");
             }
         }
     }
@@ -275,7 +275,7 @@ impl FodEngine {
         if was_hbm_on {
             self.set_local_hbm(HBM_OFF);
         }
-        logi!("FodEngine reset: {reason}");
+        logi!("fod=reset reason={reason}");
     }
 
     fn check_fod_touch_status(&self) {
@@ -311,7 +311,7 @@ impl FodEngine {
             }
         }
         logi!(
-            "checkFodTouchStatus FP:{fp_mode} gxzwAnim:{} colorfade:{} lockoutmode:{lockout_mode} powermode:{logged_power} TouchEnable:{touch_enable}",
+            "touch-gate fp={fp_mode} anim={} fade={} lock={lockout_mode} power={logged_power} enable={touch_enable}",
             gxzw_anim as u32,
             colorfade as u32
         );
@@ -322,7 +322,7 @@ impl FodEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .touch_enable = touch_enable;
-        logi!("HandleFodTouchCtl:{touch_enable}");
+        logi!("touch-gate apply={touch_enable}");
         crate::touchfeature::set_touch_mode(touch_enable);
     }
 
@@ -345,11 +345,11 @@ impl FodEngine {
                 .unwrap_or_else(|e| e.into_inner())
                 .touch_enable = 1;
             logi!(
-                "checkFodTouchStatusPrePowerMode FP:{fp_mode} gxzwAnim:{} colorfade:{} powermode:0 TouchEnable:1",
+                "touch-gate prepower fp={fp_mode} anim={} fade={} enable=1",
                 gxzw_anim as u32,
                 colorfade as u32
             );
-            logi!("HandleFodTouchCtl:3");
+            logi!("touch-gate apply=3");
             crate::touchfeature::set_touch_mode(3);
         }
     }
@@ -368,9 +368,9 @@ impl FodEngine {
         let ret = unsafe { libc::ioctl(file.as_raw_fd(), IOCTL_SET_LOCAL_HBM, buf.as_ptr()) };
         if ret < 0 {
             let e = std::io::Error::last_os_error();
-            loge!("setLocalHBM {value} failed: {e}");
+            loge!("hbm val={value} result=error err={e}");
         } else {
-            logi!("setLocalHBM set local hbm:{value}");
+            logi!("hbm val={value} result=ok");
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.hbm_on = value >= HBM_ON_STATE_1;
             if !state.hbm_on {
@@ -383,10 +383,10 @@ impl FodEngine {
         let Some(hal) = self.hal.as_ref() else {
             return;
         };
-        logd!("SendExtCmd cmd {cmd},param {param}");
+        logd!("hal-cmd id={cmd} val={param}");
         let ret = hal.ext_cmd(cmd, param);
         if ret != 0 {
-            logw!("SendExtCmd cmd {cmd},param {param} returned {ret}");
+            logw!("hal-cmd id={cmd} val={param} rc={ret}");
         }
     }
 
@@ -396,7 +396,7 @@ impl FodEngine {
             .name("fod-display".into())
             .spawn(move || engine.display_monitor())
         {
-            loge!("spawn fod-display failed: {e}");
+            loge!("thread=display result=spawn-error err={e}");
         }
     }
 
@@ -405,12 +405,12 @@ impl FodEngine {
             let mut file = match open_disp_feature() {
                 Ok(file) => file,
                 Err(e) => {
-                    loge!("DisplayMonitor open {DISP_FEATURE} failed: {e}");
+                    loge!("display=open-error node={DISP_FEATURE} err={e}");
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 }
             };
-            logi!("DisplayMonitor open {DISP_FEATURE} success");
+            logi!("display=ready node={DISP_FEATURE}");
             register_display_events(file.as_raw_fd());
             let mut pfd = libc::pollfd {
                 fd: file.as_raw_fd(),
@@ -425,26 +425,26 @@ impl FodEngine {
                     if e.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    loge!("DisplayMonitor poll failed: {e}");
+                    loge!("display=poll-error err={e}");
                     thread::sleep(Duration::from_secs(1));
                     break;
                 }
                 if ret == 0 {
                     continue;
                 }
-                logd!("DisplayMonitor poll revents={:#x}", pfd.revents);
+                logd!("display=poll revents={:#x}", pfd.revents);
                 match file.read(&mut buf) {
                     Ok(0) => {
-                        logd!("DisplayMonitor read 0");
+                        logd!("display=read n=0");
                         thread::sleep(Duration::from_millis(10));
                     }
                     Ok(n) => {
-                        logd!("DisplayMonitor read {n} bytes {:02x?}", &buf[..n.min(32)]);
+                        logd!("display=read n={n} bytes={:02x?}", &buf[..n.min(32)]);
                         self.handle_display_buffer(&buf[..n]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(e) => {
-                        loge!("DisplayMonitor read failed: {e}");
+                        loge!("display=read-error err={e}");
                         thread::sleep(Duration::from_secs(1));
                         break;
                     }
@@ -461,25 +461,25 @@ impl FodEngine {
                 u32::from_ne_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
             if size < 16 || offset + size > buf.len() {
                 logw!(
-                    "DisplayMonitor invalid size={size} offset={offset} len={}",
+                    "display=frame-error size={size} off={offset} len={}",
                     buf.len()
                 );
                 break;
             }
             let value = u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap());
-            logd!("DisplayMonitor event size={size} type={typ} value={value}");
+            logd!("display-frame size={size} type={typ} val={value}");
             match typ {
                 EVENT_DISPLAY => {
-                    logi!("MI_DISP_EVENT_Display:{value}");
+                    logi!("display-event kind=display val={value}");
                     self.handle_display_event(value);
                 }
                 EVENT_BRIGHTNESS => {
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.brightness = value;
-                    logd!("MI_DISP_EVENT_Brightness:{value}");
+                    logd!("display-event kind=brightness val={value}");
                 }
                 other => {
-                    logd!("MI_DISP_EVENT type={other} value={value}");
+                    logd!("display-event kind={other} val={value}");
                 }
             }
             offset += size;
@@ -499,7 +499,7 @@ impl FodEngine {
             if already {
                 return;
             }
-            logi!("fod capture start low_brightness={low_brightness}");
+            logi!("sensor-capture=start low-light={low_brightness}");
             if x != 0 && y != 0 {
                 self.hal_ext_cmd(2, x);
                 self.hal_ext_cmd(3, y);
@@ -513,7 +513,7 @@ impl FodEngine {
                 was_capturing
             };
             if was_capturing {
-                logi!("fod capture stop");
+                logi!("sensor-capture=stop");
                 self.hal_ext_cmd(10, 0);
             }
         }
@@ -525,7 +525,7 @@ impl FodEngine {
             .name("fod-touch".into())
             .spawn(move || engine.touch_monitor())
         {
-            loge!("spawn fod-touch failed: {e}");
+            loge!("thread=touch result=spawn-error err={e}");
         }
     }
 
@@ -533,11 +533,11 @@ impl FodEngine {
         let file = match File::open(FOD_STATUS) {
             Ok(file) => file,
             Err(e) => {
-                loge!("open {FOD_STATUS} failed: {e}");
+                loge!("sensor=open-error node={FOD_STATUS} err={e}");
                 return;
             }
         };
-        logi!("open {FOD_STATUS} success");
+        logi!("sensor=ready node={FOD_STATUS}");
         let mut last = None;
         let mut buf = [0u8; 1];
         let mut last_error = false;
@@ -549,10 +549,10 @@ impl FodEngine {
                     if last != Some(down) {
                         last = Some(down);
                         if down {
-                            logi!("fod_press_status down");
+                            logi!("sensor=press state=down");
                             self.on_finger_down();
                         } else {
-                            logi!("fod_press_status up");
+                            logi!("sensor=press state=up");
                             self.on_finger_up();
                         }
                     }
@@ -560,7 +560,7 @@ impl FodEngine {
                 Ok(_) => {}
                 Err(e) => {
                     if !last_error {
-                        loge!("read {FOD_STATUS} failed: {e}");
+                        loge!("sensor=read-error err={e}");
                         last_error = true;
                     }
                 }
@@ -576,7 +576,7 @@ impl FodEngine {
             .unwrap_or_else(|e| e.into_inner())
             .hal_state;
         if !matches!(hal_state, 1 | 3 | 5) {
-            logi!("skip FOD touch down: hal state {hal_state}");
+            logi!("touch=down result=skip hal={hal_state}");
             return;
         }
         let (x, y) = {
@@ -587,7 +587,7 @@ impl FodEngine {
             state.touch_down = true;
             (state.x, state.y)
         };
-        logi!("SYS_NODE_EVENT_FINGER_DOWN state={hal_state}");
+        logi!("touch=down hal={hal_state}");
         self.hal_ext_cmd(2, 0);
         self.hal_ext_cmd(3, 0);
         self.handle_local_hbm_set(true);
@@ -597,6 +597,7 @@ impl FodEngine {
             self.hal_ext_cmd(3, y);
         }
         crate::touchfeature::set_auth_state(0);
+        crate::oplus_fingerprint::on_touch_down();
     }
 
     fn on_finger_up(&self) {
@@ -616,9 +617,10 @@ impl FodEngine {
         }
         self.handle_local_hbm_set(false);
         if was_down {
-            logi!("SYS_NODE_EVENT_FINGER_UP");
+            logi!("touch=up");
             self.hal_ext_cmd(1, 0);
         }
+        crate::oplus_fingerprint::on_touch_up();
     }
 
     fn handle_local_hbm_set(&self, down: bool) {
@@ -637,7 +639,7 @@ impl FodEngine {
         let fp_mode = self.state.lock().unwrap_or_else(|e| e.into_inner()).fp_mode;
         let eligible = fp_mode < 6 && (1u32.wrapping_shl(fp_mode & 0x1f) & 0x2a) != 0;
         if !eligible {
-            logi!("skip enable lhbm as fingerprint is idle");
+            logi!("hbm=skip reason=idle");
             return;
         }
         let want_low = fp_mode == 3
@@ -661,19 +663,44 @@ impl FodEngine {
         }
     }
 
+    pub fn light_off(&self, reason: &str) {
+        let active = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.hbm_target || state.hbm_on
+        };
+        if active {
+            self.set_local_hbm(HBM_OFF);
+            logi!("hbm=off reason={reason}");
+        }
+    }
+
+    pub fn on_acquired(&self, code: u32) {
+        if (1..=5).contains(&code) {
+            self.light_off("acquired");
+        }
+    }
+
+    pub fn on_auth_failed(&self) {
+        self.light_off("auth-failed");
+    }
+
+    pub fn on_enroll_progress(&self) {
+        self.light_off("enroll-progress");
+    }
+
     fn start_evdev_monitor(self: &Arc<Self>) {
         let engine = Arc::clone(self);
         if let Err(e) = thread::Builder::new()
             .name("fod-evdev".into())
             .spawn(move || engine.evdev_monitor())
         {
-            loge!("spawn fod-evdev failed: {e}");
+            loge!("thread=evdev result=spawn-error err={e}");
         }
     }
 
     fn evdev_monitor(&self) {
         let Some(path) = find_touch_event_path() else {
-            loge!("touch event device not found");
+            loge!("evdev=missing");
             return;
         };
         let mut file = match OpenOptions::new()
@@ -683,7 +710,7 @@ impl FodEngine {
         {
             Ok(file) => file,
             Err(e) => {
-                loge!("open {path} failed: {e}");
+                loge!("evdev=open-error path={path} err={e}");
                 return;
             }
         };
@@ -705,7 +732,7 @@ impl FodEngine {
         let right = fod_x + fod_w + margin;
         let top = fod_y - margin;
         let bottom = fod_y + fod_h + margin;
-        logi!("open {path} success, resolution factor {factor}");
+        logi!("evdev=ready path={path} scale={factor}");
         let mut buf = [0u8; 24 * 16];
         let mut raw_down = false;
         loop {
@@ -734,11 +761,11 @@ impl FodEngine {
                             if value == 1 {
                                 if !raw_down {
                                     raw_down = true;
-                                    logd!("BTN_TOUCH down");
+                                    logd!("evdev=btn state=down");
                                 }
                             } else if value == 0 && raw_down {
                                 raw_down = false;
-                                logd!("BTN_TOUCH up");
+                                logd!("evdev=btn state=up");
                             }
                         }
                     }
@@ -750,8 +777,8 @@ impl FodEngine {
                         && (top..=bottom).contains(&(y as i32));
                     let ready = matches!(hal_state, 1 | 3 | 5);
                     if coordinate_updated && in_fod && (ready || touch_down) {
-                        logd!("mTouchCenterX:{x}");
-                        logd!("mTouchCenterY:{y}");
+                        logd!("evdev=center x={x}");
+                        logd!("evdev=center y={y}");
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -759,7 +786,7 @@ impl FodEngine {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    loge!("read {path} failed: {e}");
+                    loge!("evdev=read-error path={path} err={e}");
                     thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -784,9 +811,9 @@ fn register_display_events(fd: RawFd) {
             let ret = unsafe { libc::ioctl(fd, IOCTL_REGISTER_EVENT, buf.as_ptr()) };
             if ret < 0 {
                 let e = std::io::Error::last_os_error();
-                logw!("register display event cookie={cookie} type={typ} failed: {e}");
+                logw!("display=register cookie={cookie} type={typ} result=error err={e}");
             } else {
-                logi!("register display event cookie={cookie} type={typ} success");
+                logi!("display=register cookie={cookie} type={typ} result=ok");
             }
         }
     }

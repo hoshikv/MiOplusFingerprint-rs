@@ -130,13 +130,13 @@ impl Hal {
         unsafe {
             let lib = dlopen(c"libhardware.so".as_ptr(), RTLD_NOW | RTLD_LOCAL);
             if lib.is_null() {
-                crate::loge!("failed to dlopen libhardware.so");
+                crate::loge!("hal=error stage=libhardware-open");
                 return None;
             }
 
             let sym = dlsym(lib, c"hw_get_module_by_class".as_ptr());
             if sym.is_null() {
-                crate::loge!("libhardware.so has no hw_get_module_by_class");
+                crate::loge!("hal=error stage=libhardware-symbol");
                 return None;
             }
             let get_module: GetModuleByClass = std::mem::transmute(sym);
@@ -144,7 +144,7 @@ impl Hal {
             let configured = get_prop("persist.vendor.sys.fp.vendor").unwrap_or_default();
             if !configured.is_empty() {
                 if let Some((dev, module_lib)) = open_vendor(get_module, &configured) {
-                    crate::logi!("opened fingerprint HAL vendor {configured}");
+                    crate::logi!("hal=open vendor={configured}");
                     return Some(Hal {
                         _lib: lib,
                         _module_lib: module_lib,
@@ -171,7 +171,7 @@ impl Hal {
                 }
                 match open_vendor(get_module, vendor) {
                     Some((dev, module_lib)) => {
-                        crate::logi!("opened fingerprint HAL vendor {vendor}");
+                        crate::logi!("hal=open vendor={vendor}");
                         set_prop("persist.vendor.sys.fp.vendor", vendor);
                         return Some(Hal {
                             _lib: lib,
@@ -181,12 +181,12 @@ impl Hal {
                         });
                     }
                     None => {
-                        crate::logd!("fingerprint HAL vendor {vendor} unavailable");
+                        crate::logd!("hal=skip vendor={vendor} reason=unavailable");
                     }
                 }
             }
 
-            crate::loge!("failed to find a usable fingerprint vendor HAL");
+            crate::loge!("hal=error stage=no-vendor");
             None
         }
     }
@@ -337,7 +337,7 @@ unsafe fn open_module(module: *mut HwModule) -> Option<*mut c_void> {
     }
     if unsafe { (*device).version } != FINGERPRINT_DEVICE_VERSION {
         crate::loge!(
-            "wrong fingerprint device version {:#x}, expected {:#x}",
+            "hal=error stage=device-version got={:#x} want={:#x}",
             unsafe { (*device).version },
             FINGERPRINT_DEVICE_VERSION
         );
@@ -345,11 +345,11 @@ unsafe fn open_module(module: *mut HwModule) -> Option<*mut c_void> {
     }
     let Some(set_notify) = (unsafe { slot::<SetNotify>(device as *mut c_void, OFF_SET_NOTIFY) })
     else {
-        crate::loge!("fingerprint device has no set_notify");
+        crate::loge!("hal=error stage=no-set-notify");
         return None;
     };
     if unsafe { set_notify(device as *mut c_void, hal_notify) } != 0 {
-        crate::loge!("fingerprint set_notify failed");
+        crate::loge!("hal=error stage=set-notify");
         return None;
     }
     Some(device as *mut c_void)
@@ -381,16 +381,16 @@ unsafe fn open_vendor(
         };
         let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
         if handle.is_null() {
-            crate::logd!("direct dlopen {path} failed");
+            crate::logd!("hal=direct-open-error path={path}");
             continue;
         }
         let sym = unsafe { dlsym(handle, c"HMI".as_ptr()) };
         if sym.is_null() {
-            crate::logd!("direct dlopen {path} has no HMI");
+            crate::logd!("hal=direct-symbol-error path={path}");
             continue;
         }
         if let Some(dev) = unsafe { open_module(sym as *mut HwModule) } {
-            crate::logi!("loaded fingerprint HAL directly from {path}");
+            crate::logi!("hal=direct-open path={path}");
             return Some((dev, handle));
         }
     }

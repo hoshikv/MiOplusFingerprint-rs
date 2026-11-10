@@ -1,3 +1,4 @@
+pub mod oplus_fingerprint;
 pub mod fod;
 pub mod hal;
 pub mod log;

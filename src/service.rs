@@ -180,8 +180,12 @@ impl Daemon {
         self.shared.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn callback(&self) -> Option<Strong<dyn Cb>> {
+    pub(crate) fn callback(&self) -> Option<Strong<dyn Cb>> {
         self.shared().callback.clone()
+    }
+
+    pub(crate) fn fod(&self) -> &Arc<FodEngine> {
+        &self.fod
     }
 
     fn global_status(&self) -> i32 {
@@ -240,6 +244,7 @@ fn handle_job(daemon: &Arc<Daemon>, job: Job) {
         }
         Job::Enroll(state, token) => {
             if begin_request(daemon, &state, SESSION_ENROLL, Some(GS_ENROLL)) {
+                crate::oplus_fingerprint::on_operation_start(crate::oplus_fingerprint::Operation::Enroll);
                 if let Some(hal) = daemon.hal.as_ref() {
                     hal.enroll(&token);
                 }
@@ -248,6 +253,7 @@ fn handle_job(daemon: &Arc<Daemon>, job: Job) {
         }
         Job::Authenticate(state, operation_id) => {
             if begin_request(daemon, &state, SESSION_AUTHENTICATE, Some(GS_AUTHENTICATE)) {
+                crate::oplus_fingerprint::on_operation_start(crate::oplus_fingerprint::Operation::Auth);
                 if let Some(hal) = daemon.hal.as_ref() {
                     hal.authenticate(operation_id);
                 }
@@ -303,10 +309,12 @@ fn handle_job(daemon: &Arc<Daemon>, job: Job) {
                 hal.cancel();
             }
             daemon.fod.reset("cancel");
+            crate::oplus_fingerprint::on_cancelled();
         }
         Job::ClientDied(state) => {
             state.status.store(SESSION_CLOSED, Ordering::SeqCst);
             daemon.fod.reset("client died");
+            crate::oplus_fingerprint::on_cancelled();
             let mut shared = daemon.shared();
             if shared.current_session_id == state.id {
                 shared.callback = None;
@@ -326,13 +334,14 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
     match msg.typ {
         1 => {
             let raw = u32_at(&msg.data, 0);
+            daemon.fod.on_acquired(raw);
             if raw >= 1000 {
                 let vendor_code = (raw - 1000) as i32;
                 if daemon.fod.anti_mistouch_should_report(vendor_code) {
                     daemon.fod.note_mistouch();
                     if let Some(cb) = daemon.callback() {
                         if let Err(e) = cb.onAcquired(AcquiredInfo::VENDOR, vendor_code) {
-                            crate::logw!("onAcquired failed: {e:?}");
+                            crate::logw!("callback=acquired result=error err={e:?}");
                         }
                     }
                     return;
@@ -354,20 +363,21 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
             };
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onAcquired(info, vendor_code) {
-                    crate::logw!("onAcquired failed: {e:?}");
+                    crate::logw!("callback=acquired result=error err={e:?}");
                 }
             }
         }
         3 => {
             if daemon.global_status() == GS_IDLE {
-                crate::logd!("ignoring enroll notification while idle");
+                crate::logd!("notify=enroll result=ignored reason=idle");
                 return;
             }
             let enrollment_id = u32_at(&msg.data, 0) as i32;
             let remaining = u32_at(&msg.data, 4) as i32;
+            daemon.fod.on_enroll_progress();
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onEnrollmentProgress(enrollment_id, remaining) {
-                    crate::logw!("onEnrollmentProgress failed: {e:?}");
+                    crate::logw!("callback=enroll-progress result=error err={e:?}");
                 }
             }
             if remaining == 0 {
@@ -378,23 +388,24 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
             let ids = collect_ids(&msg.data);
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onEnrollmentsRemoved(&ids) {
-                    crate::logw!("onEnrollmentsRemoved failed: {e:?}");
+                    crate::logw!("callback=enrollments-removed result=error err={e:?}");
                 }
             }
             daemon.set_global_status(GS_IDLE);
         }
         5 => {
             if daemon.global_status() == GS_IDLE {
-                crate::logd!("ignoring authenticated notification while idle");
+                crate::logd!("notify=auth result=ignored reason=idle");
                 return;
             }
             let enrollment_id = u32_at(&msg.data, 0) as i32;
             let mistouch_reported = daemon.fod.take_mistouch_reported();
             if enrollment_id == 0 {
+                daemon.fod.on_auth_failed();
                 if !mistouch_reported {
                     if let Some(cb) = daemon.callback() {
                         if let Err(e) = cb.onAuthenticationFailed() {
-                            crate::logw!("onAuthenticationFailed failed: {e:?}");
+                            crate::logw!("callback=auth-failed result=error err={e:?}");
                         }
                     }
                     if daemon.sensor_type & 0xfe == 2 {
@@ -407,11 +418,12 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
                 let token = parse_legacy_token(&msg.data[4..4 + TOKEN_LEN]);
                 if let Some(cb) = daemon.callback() {
                     if let Err(e) = cb.onAuthenticationSucceeded(enrollment_id, &token) {
-                        crate::logw!("onAuthenticationSucceeded failed: {e:?}");
+                        crate::logw!("callback=auth-pass result=error err={e:?}");
                     }
                 }
                 reset_lockout_state(daemon, false);
                 crate::touchfeature::set_auth_state(0);
+                crate::oplus_fingerprint::on_auth_success();
                 daemon.set_global_status(GS_IDLE);
             }
         }
@@ -419,7 +431,7 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
             let ids = collect_ids(&msg.data);
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onEnrollmentsEnumerated(&ids) {
-                    crate::logw!("onEnrollmentsEnumerated failed: {e:?}");
+                    crate::logw!("callback=enrollments-list result=error err={e:?}");
                 }
             }
             daemon.set_global_status(GS_IDLE);
@@ -427,28 +439,28 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
         7 => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onChallengeGenerated(u64_at(&msg.data, 0) as i64) {
-                    crate::logw!("onChallengeGenerated failed: {e:?}");
+                    crate::logw!("callback=challenge-gen result=error err={e:?}");
                 }
             }
         }
         8 => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onChallengeRevoked(u64_at(&msg.data, 0) as i64) {
-                    crate::logw!("onChallengeRevoked failed: {e:?}");
+                    crate::logw!("callback=challenge-revoke result=error err={e:?}");
                 }
             }
         }
         9 => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onAuthenticatorIdRetrieved(u64_at(&msg.data, 0) as i64) {
-                    crate::logw!("onAuthenticatorIdRetrieved failed: {e:?}");
+                    crate::logw!("callback=auth-id-get result=error err={e:?}");
                 }
             }
         }
         10 => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onAuthenticatorIdInvalidated(u64_at(&msg.data, 0) as i64) {
-                    crate::logw!("onAuthenticatorIdInvalidated failed: {e:?}");
+                    crate::logw!("callback=auth-id-invalidate result=error err={e:?}");
                 }
             }
         }
@@ -457,6 +469,7 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
         }
         -1 => {
             daemon.fod.reset("hal error");
+            crate::oplus_fingerprint::on_cancelled();
             let raw = u32_at(&msg.data, 0);
             let (error, vendor_code) = match raw {
                 1 => (Error::HW_UNAVAILABLE, 0),
@@ -467,7 +480,7 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
                 6 => (Error::UNABLE_TO_REMOVE, 0),
                 raw if raw >= 1000 => (Error::VENDOR, (raw - 1000) as i32),
                 _ => {
-                    crate::logw!("unknown vendor error {raw}");
+                    crate::logw!("hal-error code={raw} result=unknown");
                     (Error::UNABLE_TO_PROCESS, 0)
                 }
             };
@@ -476,12 +489,12 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
             }
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onError(error, vendor_code) {
-                    crate::logw!("onError failed: {e:?}");
+                    crate::logw!("callback=error result=error err={e:?}");
                 }
             }
         }
         other => {
-            crate::logw!("unknown fingerprint notify type {other}");
+            crate::logw!("notify type={other} result=unknown");
         }
     }
 }
@@ -517,7 +530,7 @@ fn add_failed_attempts(daemon: &Arc<Daemon>) {
         Action::Timed(generation) => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onLockoutTimed(30_000) {
-                    crate::logw!("onLockoutTimed failed: {e:?}");
+                    crate::logw!("callback=lockout-timed result=error err={e:?}");
                 }
             }
             let daemon = Arc::clone(daemon);
@@ -542,7 +555,7 @@ fn add_failed_attempts(daemon: &Arc<Daemon>) {
                     if expired {
                         if let Some(cb) = daemon.callback() {
                             if let Err(e) = cb.onLockoutCleared() {
-                                crate::logw!("onLockoutCleared failed: {e:?}");
+                                crate::logw!("callback=lockout-cleared result=error err={e:?}");
                             }
                         }
                     }
@@ -552,7 +565,7 @@ fn add_failed_attempts(daemon: &Arc<Daemon>) {
         Action::Permanent => {
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onLockoutPermanent() {
-                    crate::logw!("onLockoutPermanent failed: {e:?}");
+                    crate::logw!("callback=lockout-permanent result=error err={e:?}");
                 }
             }
             if let Some(hal) = daemon.hal.as_ref() {
@@ -577,7 +590,7 @@ fn reset_lockout_state(daemon: &Daemon, notify: bool) {
     if notify {
         if let Some(cb) = daemon.callback() {
             if let Err(e) = cb.onLockoutCleared() {
-                crate::logw!("onLockoutCleared failed: {e:?}");
+                crate::logw!("callback=lockout-cleared result=error err={e:?}");
             }
         }
     }
@@ -709,10 +722,10 @@ impl IFingerprintTrait for Fingerprint {
         callback: &Strong<dyn Cb>,
     ) -> binder::Result<Strong<dyn SessionTrait>> {
         if sensor_id < 0 || user_id < 0 {
-            crate::logw!("createSession with invalid sensorId={sensor_id} userId={user_id}");
+            crate::logw!("session=create result=invalid sensor={sensor_id} user={user_id}");
         }
 
-        crate::logi!("createSession: sensorId={sensor_id}, userId={user_id}");
+        crate::logi!("session=create sensor={sensor_id} user={user_id}");
         let path = format!("/data/vendor_de/{user_id}/fpdata");
         let id = self.daemon.next_session_id();
         let state = Arc::new(SessionState::new(id, callback.clone()));
@@ -741,10 +754,10 @@ impl IFingerprintTrait for Fingerprint {
                 Ok(path) => {
                     let ret = hal.set_active_group(user_id as u32, &path);
                     if ret != 0 {
-                        crate::logw!("set_active_group({user_id}, {path:?}) returned {ret}");
+                        crate::logw!("group=set user={user_id} path={path:?} rc={ret}");
                     }
                 }
-                Err(_) => crate::logw!("invalid fpdata path {path:?}"),
+                Err(_) => crate::logw!("group=set result=invalid-path path={path:?}"),
             }
         }
 
@@ -777,7 +790,7 @@ impl Session {
 
     fn send(&self, job: Job) {
         if let Err(e) = self.daemon.tx.send(job) {
-            crate::logw!("failed to enqueue session job: {e}");
+            crate::logw!("job=session result=queue-error err={e}");
         }
     }
 
@@ -892,6 +905,7 @@ impl SessionTrait for Session {
     fn r#close(&self) -> binder::Result<()> {
         self.state.status.store(SESSION_CLOSED, Ordering::SeqCst);
         self.daemon.fod.reset("session close");
+        crate::oplus_fingerprint::on_session_close();
         let callback = self
             .state
             .callback
@@ -900,7 +914,7 @@ impl SessionTrait for Session {
             .clone();
         if let Some(cb) = callback {
             if let Err(e) = cb.onSessionClosed() {
-                crate::logw!("onSessionClosed failed: {e:?}");
+                crate::logw!("callback=closed result=error err={e:?}");
             }
         }
         let _ = self
@@ -921,20 +935,20 @@ impl SessionTrait for Session {
         minor: f32,
         major: f32,
     ) -> binder::Result<()> {
-        crate::logi!("onPointerDown id={pointer_id} x={x} y={y} minor={minor} major={major}");
+        crate::logi!("pointer=down id={pointer_id} x={x} y={y} minor={minor} major={major}");
         self.reset_status_unless_closed();
         Ok(())
     }
 
     #[allow(deprecated)]
     fn r#onPointerUp(&self, pointer_id: i32) -> binder::Result<()> {
-        crate::logi!("onPointerUp id={pointer_id}");
+        crate::logi!("pointer=up id={pointer_id}");
         self.reset_status_unless_closed();
         Ok(())
     }
 
     fn r#onUiReady(&self) -> binder::Result<()> {
-        crate::logi!("onUiReady");
+        crate::logi!("ui=ready");
         self.reset_status_unless_closed();
         Ok(())
     }
@@ -964,7 +978,7 @@ impl SessionTrait for Session {
 
     fn r#onPointerDownWithContext(&self, context: &PointerContext) -> binder::Result<()> {
         crate::logi!(
-            "onPointerDown id={} x={} y={} minor={} major={}",
+            "pointer=down id={} x={} y={} minor={} major={}",
             context.pointerId,
             context.x,
             context.y,
@@ -976,7 +990,7 @@ impl SessionTrait for Session {
     }
 
     fn r#onPointerUpWithContext(&self, context: &PointerContext) -> binder::Result<()> {
-        crate::logi!("onPointerUp id={}", context.pointerId);
+        crate::logi!("pointer=up id={}", context.pointerId);
         self.reset_status_unless_closed();
         Ok(())
     }
@@ -1002,16 +1016,16 @@ impl Interface for CancellationSignal {}
 
 impl CancellationTrait for CancellationSignal {
     fn r#cancel(&self) -> binder::Result<()> {
-        crate::logi!("Session cancel");
+        crate::logi!("session=cancel");
         if self.daemon.global_status() == GS_IDLE {
-            crate::logw!("MFP IDLE Error Cancel");
+            crate::logw!("session=cancel result=idle");
             if let Some(cb) = self.daemon.callback() {
                 if let Err(e) = cb.onError(Error::CANCELED, 0) {
-                    crate::logw!("failed to invoke fingerprint onError callback: {e:?}");
+                    crate::logw!("callback=error result=invoke-error err={e:?}");
                 }
             }
         } else if let Err(e) = self.daemon.tx.send(Job::Cancel) {
-            crate::logw!("failed to enqueue cancel: {e}");
+            crate::logw!("job=cancel result=queue-error err={e}");
         }
         Ok(())
     }
@@ -1040,7 +1054,7 @@ impl XiaomiTrait for XiaomiFingerprint {
             }
             10 => {
                 if self.daemon.fod.is_enabled() {
-                    crate::logd!("Ignore FOD_UI_READY_CMD as FodEngine Enabled");
+                    crate::logd!("ui-ready=skip reason=fod-engine");
                     0
                 } else {
                     self.daemon
@@ -1069,7 +1083,7 @@ impl XiaomiTrait for XiaomiFingerprint {
                 0
             }
             15 => {
-                crate::logd!("handlerCloudUpdateLowBrightnessAuth");
+                crate::logd!("cfg=low-brightness-auth");
                 0
             }
             17 => {
@@ -1077,7 +1091,7 @@ impl XiaomiTrait for XiaomiFingerprint {
                 0
             }
             _ => {
-                crate::logw!("unknown Xiaomi extCmd {cmd}");
+                crate::logw!("ext-cmd id={cmd} result=unknown");
                 0
             }
         };

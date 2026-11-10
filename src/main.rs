@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 fn main() {
-    logi!("fingerprint AIDL HAL starting");
+    logi!("daemon=start");
 
     binder::ProcessState::set_thread_pool_max_thread_count(0);
 
@@ -16,13 +16,14 @@ fn main() {
     let hal = hal::Hal::open().map(Arc::new);
     drop(notify_tx);
     let daemon = Daemon::start(hal, notify_rx);
+    mfp_daemon::oplus_fingerprint::start(daemon.clone());
 
     let fingerprint =
         BnFingerprint::new_binder(Fingerprint::new(daemon.clone()), BinderFeatures::default());
     if let Err(e) =
         binder::register_lazy_service(service::FINGERPRINT_SERVICE, fingerprint.as_binder())
     {
-        loge!("failed to register {}: {e:?}", service::FINGERPRINT_SERVICE);
+        loge!("service=register-error name={} err={e:?}", service::FINGERPRINT_SERVICE);
         return;
     }
 
@@ -34,10 +35,10 @@ fn main() {
             BinderFeatures::default(),
         );
         if let Err(e) = binder::add_service(service::XIAOMI_SERVICE, xiaomi.as_binder()) {
-            loge!("failed to register {}: {e:?}", service::XIAOMI_SERVICE);
+            loge!("service=register-error name={} err={e:?}", service::XIAOMI_SERVICE);
         }
     }
 
-    logi!("fingerprint AIDL HAL ready");
+    logi!("daemon=ready");
     binder::ProcessState::join_thread_pool();
 }

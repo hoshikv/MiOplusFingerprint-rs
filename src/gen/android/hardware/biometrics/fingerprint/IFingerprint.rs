@@ -308,6 +308,10 @@ fn on_transact(_aidl_service: &dyn IFingerprint, _aidl_code: binder::binder_impl
       }
       Ok(())
     }
+    code if code == crate::oplus_fingerprint::SEND_FINGERPRINT_CMD_TX => {
+      crate::oplus_fingerprint::handle_send_fingerprint_cmd(_aidl_data, _aidl_reply)?;
+      Ok(())
+    }
     _ => Err(binder::StatusCode::UNKNOWN_TRANSACTION)
   }
 }
