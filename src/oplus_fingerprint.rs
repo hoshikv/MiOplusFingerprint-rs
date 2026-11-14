@@ -104,8 +104,16 @@ fn state_lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn user_unlocked() -> bool {
+    crate::hal::get_prop_bool("sys.user.0.ce_available")
+}
+
 impl OplusFingerprint {
     fn arm(&self) {
+        if !user_unlocked() {
+            self.disarm_with("user-locked");
+            return;
+        }
         let fod = self.daemon.fod();
         fod.on_ext_cmd(4, 1);
         fod.on_ext_cmd(1, 1);
@@ -113,11 +121,15 @@ impl OplusFingerprint {
     }
 
     fn disarm(&self) {
+        self.disarm_with("disarm");
+    }
+
+    fn disarm_with(&self, reason: &str) {
         crate::touchfeature::set_touch_mode(0);
         let fod = self.daemon.fod();
         fod.on_ext_cmd(4, 0);
         fod.on_ext_cmd(1, 0);
-        logi!("fod=off");
+        logi!("fod=off reason={reason}");
     }
 
     fn send_touch(&self, cmd: i32) {
