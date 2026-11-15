@@ -4,6 +4,7 @@ pub mod hal;
 pub mod log;
 pub mod service;
 pub mod touchfeature;
+pub mod xiaomi_display;
 
 #[path = "gen/android/hardware/biometrics/fingerprint/AcquiredInfo.rs"]
 pub mod AcquiredInfo;

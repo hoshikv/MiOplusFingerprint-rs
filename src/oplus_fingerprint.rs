@@ -37,6 +37,7 @@ const FEATURE_HBM_CONTROL: i32 = 22;
 const FEATURE_AOD_SMOOTH: i32 = 217;
 const FEATURE_COLOR_CALIBRATION: i32 = 179;
 const FEATURE_AOD_COMPAT: i32 = 28;
+const FEATURE_DOZE_STATE: i32 = 195;
 
 const UDFPS_TYPE_VALUE: i32 = 0x410;
 const AOD_SMOOTH_CAPS: i32 = 0xF;
@@ -457,6 +458,12 @@ impl Remotable for PanelFeature {
                         0
                     }
                     FEATURE_AOD_COMPAT | FEATURE_AOD_SMOOTH => 0,
+                    FEATURE_DOZE_STATE => {
+                        if value == 0 || value == 1 {
+                            crate::xiaomi_display::aod_doze();
+                        }
+                        0
+                    }
                     _ => -1,
                 };
                 write_ok(reply)?;
