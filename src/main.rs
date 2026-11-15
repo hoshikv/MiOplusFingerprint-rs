@@ -7,6 +7,11 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--pickup") {
+        mfp_daemon::pickup::run_helper();
+        return;
+    }
+
     logi!("daemon=start");
 
     binder::ProcessState::set_thread_pool_max_thread_count(0);
@@ -17,6 +22,7 @@ fn main() {
     drop(notify_tx);
     let daemon = Daemon::start(hal, notify_rx);
     mfp_daemon::oplus_fingerprint::start(daemon.clone());
+    mfp_daemon::pickup::start();
 
     let fingerprint =
         BnFingerprint::new_binder(Fingerprint::new(daemon.clone()), BinderFeatures::default());

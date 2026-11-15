@@ -3,6 +3,7 @@ pub mod fod;
 pub mod hal;
 pub mod log;
 pub mod service;
+pub mod pickup;
 pub mod touchfeature;
 pub mod xiaomi_display;
 
