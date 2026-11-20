@@ -107,6 +107,13 @@ impl SessionState {
         self.status.load(Ordering::SeqCst) == SESSION_CLOSED
     }
 
+    fn callback(&self) -> Option<Strong<dyn Cb>> {
+        self.callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn finish(&self) {
         if !self.is_closed() {
             self.status.store(SESSION_IDLE, Ordering::SeqCst);
@@ -322,8 +329,18 @@ fn handle_job(daemon: &Arc<Daemon>, job: Job) {
         }
         Job::ResetLockout(state, token) => {
             if begin_request(daemon, &state, SESSION_RESET_LOCKOUT, None) {
-                if let Some(hal) = daemon.hal.as_ref() {
-                    hal.reset_lockout(&token);
+                let rc = match daemon.hal.as_ref() {
+                    Some(hal) => hal.reset_lockout(&token),
+                    None => -1,
+                };
+                reset_lockout_state(daemon, false);
+                crate::logi!("reset-lockout rc={rc}");
+                if rc == 0 {
+                    if let Some(cb) = state.callback() {
+                        if let Err(e) = cb.onLockoutCleared() {
+                            crate::logw!("callback=lockout-cleared result=error err={e:?}");
+                        }
+                    }
                 }
                 state.finish();
             }
