@@ -1,7 +1,8 @@
 use crate::{logi, logw};
 use std::ffi::{CStr, CString};
+use std::io;
 use std::os::raw::{c_char, c_int, c_void};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,24 +29,60 @@ fn run() {
             continue;
         }
         logi!("native-pickup helper=spawn path={HELPER}");
-        let result = Command::new(HELPER)
+        let mut child = match Command::new(HELPER)
             .arg("--pickup")
             .arg("--child")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        match result {
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                logw!("native-pickup helper=spawn-error err={e} path={HELPER}");
+                retry = (retry * 2).min(RETRY_MAX);
+                thread::sleep(retry);
+                continue;
+            }
+        };
+        match wait_for_exit(&mut child) {
             Ok(status) => {
                 logw!("native-pickup helper=exit status={status}");
                 retry = RETRY_MIN;
             }
             Err(e) => {
-                logw!("native-pickup helper=spawn-error err={e} path={HELPER}");
+                logw!("native-pickup helper=wait-error err={e} path={HELPER}");
                 retry = (retry * 2).min(RETRY_MAX);
             }
         }
         thread::sleep(retry);
+    }
+}
+
+fn wait_for_exit(child: &mut Child) -> io::Result<ExitStatus> {
+    let pid = child.id() as libc::pid_t;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as c_int;
+    if fd < 0 {
+        return child.wait();
+    }
+
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(fd) };
+            return child.wait();
+        }
+        unsafe { libc::close(fd) };
+        return child.wait();
     }
 }
 
