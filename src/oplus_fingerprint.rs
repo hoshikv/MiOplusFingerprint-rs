@@ -528,7 +528,6 @@ impl Remotable for PanelFeature {
                         reply.write(&values)?;
                     }
                 }
-                logd!("panel op=get feature={feature} n={requested}");
                 Ok(())
             }
             PANEL_SET_FEATURE => {

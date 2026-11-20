@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 const HELPER_DIR: &str = "/data/misc/mfp";
 const HELPER: &str = "/data/misc/mfp/mfp-pickup";
 const HELPER_TMP: &str = "/data/misc/mfp/.mfp-pickup.tmp";
-const RETRY: Duration = Duration::from_secs(5);
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 pub fn start() {
     let _ = thread::Builder::new()
@@ -18,9 +19,13 @@ pub fn start() {
 }
 
 fn run() {
+    let mut retry = RETRY_MIN;
     loop {
         if let Err(e) = install_self() {
             logw!("native-pickup helper=install-error err={e} path={HELPER}");
+            thread::sleep(retry);
+            retry = (retry * 2).min(RETRY_MAX);
+            continue;
         }
         logi!("native-pickup helper=spawn path={HELPER}");
         let result = Command::new(HELPER)
@@ -31,10 +36,16 @@ fn run() {
             .stderr(Stdio::null())
             .status();
         match result {
-            Ok(status) => logw!("native-pickup helper=exit status={status}"),
-            Err(e) => logw!("native-pickup helper=spawn-error err={e} path={HELPER}"),
+            Ok(status) => {
+                logw!("native-pickup helper=exit status={status}");
+                retry = RETRY_MIN;
+            }
+            Err(e) => {
+                logw!("native-pickup helper=spawn-error err={e} path={HELPER}");
+                retry = (retry * 2).min(RETRY_MAX);
+            }
         }
-        thread::sleep(RETRY);
+        thread::sleep(retry);
     }
 }
 
@@ -45,6 +56,16 @@ fn install_self() -> std::io::Result<()> {
     let mut dir_perms = std::fs::metadata(HELPER_DIR)?.permissions();
     dir_perms.set_mode(0o755);
     std::fs::set_permissions(HELPER_DIR, dir_perms)?;
+
+    let source_len = std::fs::metadata("/proc/self/exe")?.len();
+    if let Ok(meta) = std::fs::metadata(HELPER) {
+        if meta.len() == source_len {
+            let mut file_perms = meta.permissions();
+            file_perms.set_mode(0o755);
+            std::fs::set_permissions(HELPER, file_perms)?;
+            return Ok(());
+        }
+    }
 
     std::fs::copy("/proc/self/exe", HELPER_TMP)?;
     let mut file_perms = std::fs::metadata(HELPER_TMP)?.permissions();
@@ -57,7 +78,7 @@ fn install_self() -> std::io::Result<()> {
 const PICKUP_TYPE: c_int = 33171036;
 const PACKAGE: &str = "com.hoshikv.mfpdaemon";
 const WAKE_KEYCODE: &str = "224";
-const EVENT_RATE_US: c_int = 100_000;
+const EVENT_RATE_US: c_int = 1_000_000;
 const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
 const ALOOPER_POLL_ERROR: c_int = -4;

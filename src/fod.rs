@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -51,6 +51,7 @@ pub struct FodEngine {
     hal: Option<Arc<Hal>>,
     hbm_file: Option<Arc<File>>,
     state: Mutex<State>,
+    active: Condvar,
     anti_mistouch_enable: AtomicBool,
     anti_mistouch_threshold: AtomicI32,
     anti_mistouch_count: AtomicI32,
@@ -75,6 +76,7 @@ impl FodEngine {
             hal,
             hbm_file,
             state: Mutex::new(State::default()),
+            active: Condvar::new(),
             anti_mistouch_enable: AtomicBool::new(anti_mistouch_enable),
             anti_mistouch_threshold: AtomicI32::new(anti_mistouch_threshold),
             anti_mistouch_count: AtomicI32::new(0),
@@ -226,6 +228,7 @@ impl FodEngine {
                     state.hal_state = param;
                     previous
                 };
+                self.active.notify_all();
                 logi!("hal prev={previous} next={param}");
                 match param {
                     1 | 3 => {
@@ -419,7 +422,7 @@ impl FodEngine {
             };
             let mut buf = [0u8; 1024];
             loop {
-                let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
                 if ret < 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() == std::io::ErrorKind::Interrupted {
@@ -432,14 +435,11 @@ impl FodEngine {
                 if ret == 0 {
                     continue;
                 }
-                logd!("display=poll revents={:#x}", pfd.revents);
                 match file.read(&mut buf) {
                     Ok(0) => {
-                        logd!("display=read n=0");
                         thread::sleep(Duration::from_millis(10));
                     }
                     Ok(n) => {
-                        logd!("display=read n={n} bytes={:02x?}", &buf[..n.min(32)]);
                         self.handle_display_buffer(&buf[..n]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -467,20 +467,15 @@ impl FodEngine {
                 break;
             }
             let value = u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap());
-            logd!("display-frame size={size} type={typ} val={value}");
             match typ {
                 EVENT_DISPLAY => {
-                    logi!("display-event kind=display val={value}");
                     self.handle_display_event(value);
                 }
                 EVENT_BRIGHTNESS => {
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.brightness = value;
-                    logd!("display-event kind=brightness val={value}");
                 }
-                other => {
-                    logd!("display-event kind={other} val={value}");
-                }
+                _ => {}
             }
             offset += size;
         }
@@ -537,35 +532,99 @@ impl FodEngine {
                 return;
             }
         };
-        logi!("sensor=ready node={FOD_STATUS}");
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            loge!(
+                "sensor=epoll-error err={}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN
+                | libc::EPOLLPRI
+                | libc::EPOLLERR
+                | libc::EPOLLHUP
+                | libc::EPOLLET) as u32,
+            u64: file.as_raw_fd() as u64,
+        };
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, file.as_raw_fd(), &mut event) } < 0
+        {
+            loge!(
+                "sensor=epoll-add-error err={}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::close(epfd) };
+            return;
+        }
+        logi!("sensor=ready node={FOD_STATUS} epoll=1");
         let mut last = None;
         let mut buf = [0u8; 1];
         let mut last_error = false;
         loop {
-            match file.read_at(&mut buf, 0) {
-                Ok(n) if n > 0 => {
-                    last_error = false;
-                    let down = buf[0] != b'0';
-                    if last != Some(down) {
-                        last = Some(down);
-                        if down {
-                            logi!("sensor=press state=down");
-                            self.on_finger_down();
-                        } else {
-                            logi!("sensor=press state=up");
-                            self.on_finger_up();
-                        }
-                    }
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                while !matches!(state.hal_state, 1 | 3 | 5) {
+                    last = None;
+                    state = self.active.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    if !last_error {
-                        loge!("sensor=read-error err={e}");
-                        last_error = true;
+            }
+            self.read_fod_status(&file, &mut buf, &mut last, &mut last_error);
+            loop {
+                let ret = unsafe { libc::epoll_wait(epfd, &mut event, 1, -1) };
+                if ret < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    loge!("sensor=epoll-wait-error err={e}");
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                self.read_fod_status(&file, &mut buf, &mut last, &mut last_error);
+                let active = matches!(
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .hal_state,
+                    1 | 3 | 5
+                );
+                if !active {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn read_fod_status(
+        &self,
+        file: &File,
+        buf: &mut [u8; 1],
+        last: &mut Option<bool>,
+        last_error: &mut bool,
+    ) {
+        match file.read_at(buf, 0) {
+            Ok(n) if n > 0 => {
+                *last_error = false;
+                let down = buf[0] != b'0';
+                if *last != Some(down) {
+                    *last = Some(down);
+                    if down {
+                        logi!("sensor=press state=down");
+                        self.on_finger_down();
+                    } else {
+                        logi!("sensor=press state=up");
+                        self.on_finger_up();
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(20));
+            Ok(_) => {}
+            Err(e) => {
+                if !*last_error {
+                    loge!("sensor=read-error err={e}");
+                    *last_error = true;
+                }
+            }
         }
     }
 
@@ -719,27 +778,41 @@ impl FodEngine {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(16);
-        let (fod_x, fod_y) = hal::parse_pair(
-            hal::get_prop("persist.vendor.sys.fp.fod.location.X_Y"),
-            (505, 2333),
-        );
-        let (fod_w, fod_h) = hal::parse_pair(
-            hal::get_prop("persist.vendor.sys.fp.fod.size.width_height"),
-            (210, 210),
-        );
-        let margin = 120;
-        let left = fod_x - margin;
-        let right = fod_x + fod_w + margin;
-        let top = fod_y - margin;
-        let bottom = fod_y + fod_h + margin;
         logi!("evdev=ready path={path} scale={factor}");
         let mut buf = [0u8; 24 * 16];
         let mut raw_down = false;
+        let mut pfd = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         loop {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                while !matches!(state.hal_state, 1 | 3 | 5) {
+                    state = self.active.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            pfd.revents = 0;
+            let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                loge!("evdev=poll-error path={path} err={e}");
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            if ret == 0 {
+                continue;
+            }
             match file.read(&mut buf) {
-                Ok(0) => thread::sleep(Duration::from_millis(10)),
+                Ok(0) => {
+                    logw!("evdev=eof path={path}");
+                    thread::sleep(Duration::from_secs(1));
+                }
                 Ok(n) => {
-                    let mut coordinate_updated = false;
                     for event in buf[..n].chunks_exact(24) {
                         let typ = u16::from_ne_bytes([event[16], event[17]]);
                         let code = u16::from_ne_bytes([event[18], event[19]]);
@@ -756,7 +829,6 @@ impl FodEngine {
                             } else {
                                 state.y = value;
                             }
-                            coordinate_updated = true;
                         } else if typ == 1 && (code == 0x14a || code == 0x145) {
                             if value == 1 {
                                 if !raw_down {
@@ -769,26 +841,25 @@ impl FodEngine {
                             }
                         }
                     }
-                    let (x, y, touch_down, hal_state) = {
-                        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                        (state.x, state.y, state.touch_down, state.hal_state)
-                    };
-                    let in_fod = (left..=right).contains(&(x as i32))
-                        && (top..=bottom).contains(&(y as i32));
-                    let ready = matches!(hal_state, 1 | 3 | 5);
-                    if coordinate_updated && in_fod && (ready || touch_down) {
-                        logd!("evdev=center x={x}");
-                        logd!("evdev=center y={y}");
-                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     loge!("evdev=read-error path={path} err={e}");
                     thread::sleep(Duration::from_secs(1));
                 }
+            }
+            let active = matches!(
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .hal_state,
+                1 | 3 | 5
+            );
+            if !active {
+                break;
             }
         }
     }
