@@ -68,6 +68,7 @@ struct Shared {
     lockout: LockoutState,
     lockout_generation: u64,
     current_session_id: u64,
+    enrollments: Option<Vec<i32>>,
 }
 
 impl Default for Shared {
@@ -80,6 +81,7 @@ impl Default for Shared {
             lockout: LockoutState::None,
             lockout_generation: 0,
             current_session_id: 0,
+            enrollments: None,
         }
     }
 }
@@ -194,6 +196,28 @@ impl Daemon {
 
     fn set_global_status(&self, status: i32) {
         self.shared().global_status = status;
+    }
+
+    pub(crate) fn set_enrollments(&self, ids: Vec<i32>) {
+        self.shared().enrollments = Some(ids);
+    }
+
+    pub(crate) fn remove_enrollments(&self, ids: &[i32]) {
+        if let Some(current) = self.shared().enrollments.as_mut() {
+            current.retain(|id| !ids.contains(id));
+        }
+    }
+
+    pub(crate) fn note_enrollment(&self, id: i32) {
+        let mut shared = self.shared();
+        let ids = shared.enrollments.get_or_insert_with(Vec::new);
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    pub(crate) fn has_no_enrollments(&self) -> bool {
+        matches!(self.shared().enrollments.as_deref(), Some([]))
     }
 
     fn next_session_id(&self) -> u64 {
@@ -381,11 +405,16 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
                 }
             }
             if remaining == 0 {
+                daemon.note_enrollment(enrollment_id);
                 daemon.set_global_status(GS_IDLE);
             }
         }
         4 => {
             let ids = collect_ids(&msg.data);
+            daemon.remove_enrollments(&ids);
+            if daemon.has_no_enrollments() {
+                crate::oplus_fingerprint::on_no_enrollments();
+            }
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onEnrollmentsRemoved(&ids) {
                     crate::logw!("callback=enrollments-removed result=error err={e:?}");
@@ -429,6 +458,10 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
         }
         6 => {
             let ids = collect_ids(&msg.data);
+            daemon.set_enrollments(ids.clone());
+            if daemon.has_no_enrollments() {
+                crate::oplus_fingerprint::on_no_enrollments();
+            }
             if let Some(cb) = daemon.callback() {
                 if let Err(e) = cb.onEnrollmentsEnumerated(&ids) {
                     crate::logw!("callback=enrollments-list result=error err={e:?}");

@@ -18,6 +18,7 @@ const CMD_AUTHENTICATE_TYPE: i32 = 1005;
 const CMD_TOUCH_LISTENER: i32 = 1008;
 const CMD_GET_ENROLL_TIMES: i32 = 1010;
 const CMD_SCREEN_STATE: i32 = 1011;
+const CMD_UNLOCK_SWITCH: i32 = 1020;
 const CMD_POST_AUTH: i32 = 1024;
 
 const SCREEN_OFF: i32 = 0;
@@ -65,6 +66,7 @@ struct State {
     auth_done: bool,
     pending_down: bool,
     physical_down: bool,
+    unlock_switch: Option<bool>,
 }
 
 impl Default for State {
@@ -76,6 +78,7 @@ impl Default for State {
             auth_done: false,
             pending_down: false,
             physical_down: false,
+            unlock_switch: None,
         }
     }
 }
@@ -109,11 +112,66 @@ fn user_unlocked() -> bool {
     crate::hal::get_prop_bool("sys.user.0.ce_available")
 }
 
+fn read_unlock_switch() -> Option<bool> {
+    let output = std::process::Command::new("/system/bin/settings")
+        .args([
+            "get",
+            "secure",
+            "oplus_customize_fingerprint_unlock_switch",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    logi!("switch raw={:?} rc={:?}", text.trim(), output.status.code());
+    match text.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 impl OplusFingerprint {
+    fn unlock_switch_enabled(&self) -> bool {
+        let cached = state_lock(&self.state).unlock_switch;
+        if let Some(value) = cached {
+            return value;
+        }
+        let value = read_unlock_switch();
+        if let Some(value) = value {
+            state_lock(&self.state).unlock_switch = Some(value);
+        } else {
+            logw!("switch read=failed");
+        }
+        value.unwrap_or(true)
+    }
+
+    fn set_unlock_switch(&self, enabled: bool) {
+        let enrolling = {
+            let mut state = state_lock(&self.state);
+            state.unlock_switch = Some(enabled);
+            state.operation == Operation::Enroll.code()
+        };
+        if !enabled && !enrolling {
+            self.disarm_with("unlock-disabled");
+        }
+        logi!("switch enabled={enabled}");
+    }
+
     fn arm(&self) {
         if !user_unlocked() {
             self.disarm_with("user-locked");
             return;
+        }
+        let enrolling = state_lock(&self.state).operation == Operation::Enroll.code();
+        if !enrolling {
+            if !self.unlock_switch_enabled() {
+                self.disarm_with("unlock-disabled");
+                return;
+            }
+            if self.daemon.has_no_enrollments() {
+                self.disarm_with("no-enrollment");
+                return;
+            }
         }
         let fod = self.daemon.fod();
         fod.on_ext_cmd(4, 1);
@@ -282,6 +340,21 @@ impl OplusFingerprint {
         logi!("session phase=abort auth_done={auth_done}");
     }
 
+    fn no_enrollments(&self) {
+        {
+            let mut state = state_lock(&self.state);
+            if state.operation == Operation::Enroll.code() {
+                return;
+            }
+            state.operation = 0;
+            state.listener = false;
+            state.pending_down = false;
+            state.physical_down = false;
+        }
+        self.disarm_with("no-enrollment");
+        logi!("listen=off reason=no-enrollment");
+    }
+
     fn panel_hbm_off(&self) {
         self.disarm();
         logi!("highlight=off");
@@ -329,6 +402,12 @@ pub fn on_cancelled() {
     }
 }
 
+pub fn on_no_enrollments() {
+    if let Some(instance) = global() {
+        instance.no_enrollments();
+    }
+}
+
 fn write_ok(reply: &mut BorrowedParcel<'_>) -> Result<(), StatusCode> {
     reply.write(&Status::from(StatusCode::OK))
 }
@@ -369,6 +448,16 @@ pub fn handle_send_fingerprint_cmd(
             };
             if let Some(instance) = global() {
                 instance.authenticate_type(auth_type);
+            }
+        }
+        CMD_UNLOCK_SWITCH => {
+            let enabled = if array_len >= 1 {
+                data.read::<u8>()? != 0
+            } else {
+                true
+            };
+            if let Some(instance) = global() {
+                instance.set_unlock_switch(enabled);
             }
         }
         CMD_POST_AUTH => {
