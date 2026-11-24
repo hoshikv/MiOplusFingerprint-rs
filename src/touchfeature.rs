@@ -104,3 +104,7 @@ pub fn set_touch_mode(value: u32) {
 pub fn set_auth_state(value: u32) {
     set_mode_value(0, 41, value as i32);
 }
+
+pub fn set_aod_mode(enabled: bool) -> bool {
+    set_mode_value(0, 11, i32::from(enabled))
+}

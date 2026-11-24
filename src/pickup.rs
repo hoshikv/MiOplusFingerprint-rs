@@ -1,7 +1,11 @@
 use crate::{logi, logw};
 use std::ffi::{CStr, CString};
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr;
 use std::thread;
@@ -117,6 +121,9 @@ const PACKAGE: &str = "com.hoshikv.mfpdaemon";
 const WAKE_KEYCODE: &str = "224";
 const AOD_GESTURE_KEYCODE: &str = "134";
 const BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/panel0-backlight/brightness";
+const EV_KEY: u16 = 1;
+const KEY_GOTO: u16 = 0x0162;
+const SINGLE_TAP_DEBOUNCE: Duration = Duration::from_millis(500);
 const EVENT_RATE_US: c_int = 1_000_000;
 const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
@@ -204,6 +211,7 @@ pub fn run_helper() {
         }
     }
 
+    start_single_tap_monitor();
 
     let Some(api) = AndroidApi::load() else {
         return;
@@ -331,6 +339,150 @@ fn is_screen_off() -> bool {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .map(|b| b == 0)
         .unwrap_or(false)
+}
+
+fn start_single_tap_monitor() {
+    let _ = thread::Builder::new()
+        .name("single-tap-aod".into())
+        .spawn(run_single_tap_monitor);
+}
+
+fn run_single_tap_monitor() {
+    for attempt in 0..10 {
+        if crate::touchfeature::set_aod_mode(true) {
+            logi!("single-tap touch-aod=enabled");
+            break;
+        }
+        if attempt == 9 {
+            logw!("single-tap touch-aod=enable-failed");
+        } else {
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    let Some(path) = find_touch_event_path() else {
+        logw!("single-tap evdev=missing");
+        return;
+    };
+
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            logw!("single-tap evdev=open-error path={path} err={e}");
+            return;
+        }
+    };
+
+    let mut buf = [0u8; 24 * 16];
+    while let Ok(n) = file.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+    }
+
+    logi!("single-tap evdev=ready path={path} key={KEY_GOTO:#x}");
+
+    let mut pfd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut last = Instant::now() - SINGLE_TAP_DEBOUNCE;
+
+    loop {
+        pfd.revents = 0;
+        let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            logw!("single-tap evdev=poll-error path={path} err={e}");
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if ret == 0 || (pfd.revents & libc::POLLIN) == 0 {
+            continue;
+        }
+
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for event in buf[..n].chunks_exact(24) {
+                        let typ = u16::from_ne_bytes([event[16], event[17]]);
+                        let code = u16::from_ne_bytes([event[18], event[19]]);
+                        let value =
+                            i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
+                        if typ == EV_KEY && code == KEY_GOTO && value == 1 {
+                            let now = Instant::now();
+                            if now.duration_since(last) >= SINGLE_TAP_DEBOUNCE {
+                                last = now;
+                                on_single_tap();
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    logw!("single-tap evdev=read-error path={path} err={e}");
+                    thread::sleep(Duration::from_secs(1));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn on_single_tap() {
+    if !aod_enabled() {
+        logi!("single-tap trigger aod=disabled");
+        return;
+    }
+
+    if !is_screen_off() {
+        logi!("single-tap trigger aod=skip-screen-on");
+        return;
+    }
+
+    logi!("single-tap trigger aod=key");
+    send_keyevent(AOD_GESTURE_KEYCODE, "single-tap-aod");
+}
+
+fn find_touch_event_path() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/proc/bus/input/devices") {
+        let mut name = String::new();
+        let mut handlers = String::new();
+        for line in text.lines().chain(std::iter::once("")) {
+            if line.is_empty() {
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("goodix")
+                    || lower.contains("fts")
+                    || lower.contains("focaltech")
+                    || lower.contains("touchscreen")
+                {
+                    if let Some(event) =
+                        handlers.split_whitespace().find(|h| h.starts_with("event"))
+                    {
+                        return Some(format!("/dev/input/{event}"));
+                    }
+                }
+                name.clear();
+                handlers.clear();
+            } else if let Some(value) = line.strip_prefix("N: Name=") {
+                name = value.trim_matches('"').to_string();
+            } else if let Some(value) = line.strip_prefix("H: Handlers=") {
+                handlers = value.to_string();
+            }
+        }
+    }
+    let fallback = "/dev/input/event7";
+    Path::new(fallback).exists().then(|| fallback.to_string())
 }
 
 fn read_setting(namespace: &str, key: &str) -> Option<bool> {
