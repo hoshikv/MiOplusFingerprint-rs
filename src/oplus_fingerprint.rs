@@ -44,6 +44,22 @@ const UDFPS_TYPE_VALUE: i32 = 0x410;
 const AOD_SMOOTH_CAPS: i32 = 0xF;
 const INTERFACE_HASH: &str = "86d5512f98a34fe15c70d7bb459d3f7e853bcde3";
 
+const TOUCH_SERVICE: &str = "vendor.oplus.hardware.touch.IOplusTouch/default";
+const TOUCH_DESCRIPTOR: &str = "vendor.oplus.hardware.touch.IOplusTouch";
+const TOUCH_INTERFACE_VERSION: i32 = 2;
+const TOUCH_INTERFACE_HASH: &str = "ef41c5fab372bb5ad6a417f606845c87cf0e9b17";
+const TOUCH_INITIALIZE: TransactionCode = 1;
+const TOUCH_IS_NODE_SUPPORT: TransactionCode = 2;
+const TOUCH_READ_NODE_FILE: TransactionCode = 3;
+const TOUCH_WRITE_NODE_FILE: TransactionCode = 4;
+const TOUCH_WRITE_BT_INFO: TransactionCode = 5;
+const TOUCH_WRITE_NODE_FILE_ONEWAY: TransactionCode = 6;
+const TOUCH_NOTIFY_CLIENT: TransactionCode = 7;
+const TOUCH_REGISTER_EVENT_CALLBACK: TransactionCode = 8;
+const TOUCH_UNREGISTER_EVENT_CALLBACK: TransactionCode = 9;
+const TOUCH_NODE_COORDINATE: i32 = 2;
+const TOUCH_SINGLE_TAP_COORDS: &str = "16,500:500,500:500,500:500,500:500,500:500,500:500,0";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Enroll,
@@ -99,6 +115,7 @@ pub fn start(daemon: Arc<Daemon>) -> Arc<OplusFingerprint> {
     });
     let _ = INSTANCE.set(Arc::clone(&instance));
     register_panel_service();
+    register_touch_service();
     instance
 }
 
@@ -648,5 +665,89 @@ fn register_panel_service() {
     match binder::add_service(PANEL_SERVICE, binder.as_binder()) {
         Ok(()) => logi!("panel svc=registered"),
         Err(e) => logw!("panel svc=error err={e:?}"),
+    }
+}
+
+struct OplusTouch;
+
+impl Remotable for OplusTouch {
+    fn get_descriptor() -> &'static str {
+        TOUCH_DESCRIPTOR
+    }
+
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        data: &BorrowedParcel<'_>,
+        reply: &mut BorrowedParcel<'_>,
+    ) -> Result<(), StatusCode> {
+        match code {
+            TOUCH_INITIALIZE => {
+                write_ok(reply)?;
+                reply.write(&0i32)
+            }
+            TOUCH_IS_NODE_SUPPORT => {
+                let _device_id: i32 = data.read()?;
+                let node_flag: i32 = data.read()?;
+                let supported = if node_flag == TOUCH_NODE_COORDINATE { 1i32 } else { 0i32 };
+                write_ok(reply)?;
+                reply.write(&supported)
+            }
+            TOUCH_READ_NODE_FILE => {
+                let _device_id: i32 = data.read()?;
+                let node_flag: i32 = data.read()?;
+                let value = if node_flag == TOUCH_NODE_COORDINATE {
+                    TOUCH_SINGLE_TAP_COORDS
+                } else {
+                    ""
+                };
+                write_ok(reply)?;
+                reply.write(value)?;
+                logd!("oplus-touch op=read node={node_flag}");
+                Ok(())
+            }
+            TOUCH_WRITE_NODE_FILE
+            | TOUCH_WRITE_BT_INFO
+            | TOUCH_NOTIFY_CLIENT
+            | TOUCH_REGISTER_EVENT_CALLBACK
+            | TOUCH_UNREGISTER_EVENT_CALLBACK => {
+                write_ok(reply)?;
+                reply.write(&0i32)
+            }
+            TOUCH_WRITE_NODE_FILE_ONEWAY => Ok(()),
+            AIDL_GET_VERSION => {
+                write_ok(reply)?;
+                reply.write(&TOUCH_INTERFACE_VERSION)
+            }
+            AIDL_GET_HASH => {
+                write_ok(reply)?;
+                reply.write(TOUCH_INTERFACE_HASH)
+            }
+            _ => Err(StatusCode::UNKNOWN_TRANSACTION),
+        }
+    }
+
+    fn on_dump(&self, _file: &std::fs::File, _args: &[&std::ffi::CStr]) -> Result<(), StatusCode> {
+        Ok(())
+    }
+
+    fn get_class() -> InterfaceClass {
+        InterfaceClass::new::<Binder<OplusTouch>>()
+    }
+}
+
+fn register_touch_service() {
+    let name = CString::new(TOUCH_SERVICE).expect("touch service name");
+    let existing = unsafe { sys::AServiceManager_checkService(name.as_ptr()) };
+    if !existing.is_null() {
+        unsafe { sys::AIBinder_decStrong(existing) };
+        logi!("oplus-touch svc=present");
+        return;
+    }
+
+    let binder = Binder::new(OplusTouch);
+    match binder::add_service(TOUCH_SERVICE, binder.as_binder()) {
+        Ok(()) => logi!("oplus-touch svc=registered"),
+        Err(e) => logw!("oplus-touch svc=error err={e:?}"),
     }
 }
