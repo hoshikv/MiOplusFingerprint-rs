@@ -6,7 +6,11 @@ use binder::binder_impl::{
 use binder::{Interface, Status, StatusCode};
 use binder_ndk_sys as sys;
 use std::ffi::CString;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 pub const SEND_FINGERPRINT_CMD_TX: TransactionCode = 1019;
 
@@ -24,6 +28,9 @@ const CMD_POST_AUTH: i32 = 1024;
 const SCREEN_OFF: i32 = 0;
 const SCREEN_ON: i32 = 1;
 const SCREEN_DOZE: i32 = 2;
+
+const BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/panel0-backlight/brightness";
+const FALLBACK_BACKLIGHT: u32 = 48;
 
 const PANEL_SERVICE: &str = "vendor.oplus.hardware.displaypanelfeature.IDisplayPanelFeature/default";
 const PANEL_DESCRIPTOR: &str = "vendor.oplus.hardware.displaypanelfeature.IDisplayPanelFeature";
@@ -84,6 +91,7 @@ struct State {
     physical_down: bool,
     armed: bool,
     unlock_switch: Option<bool>,
+    last_backlight: u32,
 }
 
 impl Default for State {
@@ -97,6 +105,7 @@ impl Default for State {
             physical_down: false,
             armed: false,
             unlock_switch: None,
+            last_backlight: 0,
         }
     }
 }
@@ -104,6 +113,7 @@ impl Default for State {
 pub struct OplusFingerprint {
     daemon: Arc<Daemon>,
     state: Mutex<State>,
+    backlight_guard: AtomicBool,
 }
 
 static INSTANCE: OnceLock<Arc<OplusFingerprint>> = OnceLock::new();
@@ -112,6 +122,7 @@ pub fn start(daemon: Arc<Daemon>) -> Arc<OplusFingerprint> {
     let instance = Arc::new(OplusFingerprint {
         daemon,
         state: Mutex::new(State::default()),
+        backlight_guard: AtomicBool::new(false),
     });
     let _ = INSTANCE.set(Arc::clone(&instance));
     register_panel_service();
@@ -129,6 +140,34 @@ fn state_lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 
 fn user_unlocked() -> bool {
     crate::hal::get_prop_bool("sys.user.0.ce_available")
+}
+
+fn read_backlight() -> Option<u32> {
+    std::fs::read_to_string(BACKLIGHT_BRIGHTNESS)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+fn read_setting_backlight() -> Option<u32> {
+    let output = Command::new("/system/bin/settings")
+        .args(["get", "system", "screen_brightness"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let val = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if val == 0 {
+        return None;
+    }
+    Some(((val.saturating_mul(4095)) / 8191).clamp(15, 4095))
 }
 
 fn read_unlock_switch() -> Option<bool> {
@@ -253,27 +292,76 @@ impl OplusFingerprint {
     }
 
     fn screen_state(&self, value: i32) {
-        let (reset_auth, should_arm, should_disarm) = {
+        let (reset_auth, should_arm, should_disarm, check_backlight) = {
             let mut state = state_lock(&self.state);
             let reset_auth =
                 state.screen_state == SCREEN_ON && (value == SCREEN_OFF || value == SCREEN_DOZE);
-            state.screen_state = value;
             if reset_auth {
+                if let Some(bl) = read_backlight().filter(|&v| v > 0) {
+                    state.last_backlight = bl;
+                }
                 state.auth_done = false;
             }
+            let prev = state.screen_state;
+            state.screen_state = value;
             state.pending_down = false;
             state.physical_down = false;
             let active_op = state.operation != 0;
             let should_arm = active_op || (value != SCREEN_ON && state.listener);
             let should_disarm = value == SCREEN_ON && !active_op && state.auth_done;
-            (reset_auth, should_arm, should_disarm)
+            let check_backlight = value == SCREEN_ON && prev != SCREEN_ON && state.auth_done;
+            (reset_auth, should_arm, should_disarm, check_backlight)
         };
         if should_arm {
             self.arm();
         } else if should_disarm {
             self.disarm_with("screen-on-idle");
         }
+        if check_backlight {
+            self.schedule_backlight_restore();
+        }
         logi!("screen val={value} auth_reset={reset_auth} arm={should_arm} disarm={should_disarm}");
+    }
+
+    fn schedule_backlight_restore(&self) {
+        if self
+            .backlight_guard
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let Some(instance) = global().cloned() else {
+            self.backlight_guard.store(false, Ordering::SeqCst);
+            return;
+        };
+        let _ = thread::Builder::new()
+            .name("backlight-restore".into())
+            .spawn(move || {
+                for delay_ms in [150u64, 350u64] {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                    let (screen_state, cached) = {
+                        let state = state_lock(&instance.state);
+                        (state.screen_state, state.last_backlight)
+                    };
+                    if screen_state == SCREEN_OFF {
+                        break;
+                    }
+                    if read_backlight() == Some(0) {
+                        let target = if cached > 0 {
+                            cached
+                        } else {
+                            read_setting_backlight().unwrap_or(FALLBACK_BACKLIGHT)
+                        };
+                        if let Err(e) = std::fs::write(BACKLIGHT_BRIGHTNESS, target.to_string()) {
+                            logw!("backlight=restore-error val={target} err={e}");
+                        } else {
+                            logi!("backlight=restore val={target}");
+                        }
+                    }
+                }
+                instance.backlight_guard.store(false, Ordering::SeqCst);
+            });
     }
 
     fn authenticate_type(&self, auth_type: i32) {
@@ -357,6 +445,7 @@ impl OplusFingerprint {
             state.pending_down = false;
         }
         self.disarm();
+        self.schedule_backlight_restore();
         logi!("auth result=pass");
     }
 
@@ -515,6 +604,9 @@ pub fn handle_send_fingerprint_cmd(
         }
         CMD_POST_AUTH => {
             logi!("postauth=unlock");
+            if let Some(instance) = global() {
+                instance.schedule_backlight_restore();
+            }
         }
         other => {
             logi!("cmd id={other} result=ack");
