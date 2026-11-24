@@ -115,6 +115,8 @@ fn install_self() -> std::io::Result<()> {
 const PICKUP_TYPE: c_int = 33171036;
 const PACKAGE: &str = "com.hoshikv.mfpdaemon";
 const WAKE_KEYCODE: &str = "224";
+const AOD_GESTURE_KEYCODE: &str = "134";
+const BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/panel0-backlight/brightness";
 const EVENT_RATE_US: c_int = 1_000_000;
 const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
@@ -202,6 +204,7 @@ pub fn run_helper() {
         }
     }
 
+
     let Some(api) = AndroidApi::load() else {
         return;
     };
@@ -276,22 +279,37 @@ pub fn run_helper() {
 }
 
 fn on_pickup() {
-    if !wake_enabled() {
-        logi!("native-pickup trigger wake=disabled");
+    if wake_enabled() {
+        logi!("native-pickup trigger wake=key");
+        send_keyevent(WAKE_KEYCODE, "wake");
         return;
     }
 
-    logi!("native-pickup trigger wake=key");
+    if !aod_enabled() {
+        logi!("native-pickup trigger wake=disabled aod=disabled");
+        return;
+    }
+
+    if !is_screen_off() {
+        logi!("native-pickup trigger wake=disabled aod=skip-screen-on");
+        return;
+    }
+
+    logi!("native-pickup trigger wake=disabled aod=key");
+    send_keyevent(AOD_GESTURE_KEYCODE, "aod");
+}
+
+fn send_keyevent(keycode: &str, label: &str) {
     let result = Command::new("/system/bin/input")
-        .args(["keyevent", WAKE_KEYCODE])
+        .args(["keyevent", keycode])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     match result {
-        Ok(status) if status.success() => logi!("native-pickup wake=ok"),
-        Ok(status) => logw!("native-pickup wake=fail status={status}"),
-        Err(e) => logw!("native-pickup wake=error err={e}"),
+        Ok(status) if status.success() => logi!("native-pickup {label}=ok"),
+        Ok(status) => logw!("native-pickup {label}=fail status={status}"),
+        Err(e) => logw!("native-pickup {label}=error err={e}"),
     }
 }
 
@@ -299,6 +317,20 @@ fn wake_enabled() -> bool {
     read_setting("secure", "oplus_customize_gesture_wake_up_arouse")
         .or_else(|| read_setting("global", "ambient_tilt_to_wake"))
         .unwrap_or(true)
+}
+
+fn aod_enabled() -> bool {
+    let enabled = read_setting("secure", "Setting_AodEnable").unwrap_or(false);
+    let switch = read_setting("secure", "Setting_AodSwitchEnable").unwrap_or(true);
+    enabled && switch
+}
+
+fn is_screen_off() -> bool {
+    std::fs::read_to_string(BACKLIGHT_BRIGHTNESS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|b| b == 0)
+        .unwrap_or(false)
 }
 
 fn read_setting(namespace: &str, key: &str) -> Option<bool> {
