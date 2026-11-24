@@ -50,12 +50,69 @@ pub struct FodEngine {
     enabled: bool,
     hal: Option<Arc<Hal>>,
     hbm_file: Option<Arc<File>>,
+    touch_wake_fd: RawFd,
+    evdev_wake_fd: RawFd,
     state: Mutex<State>,
     active: Condvar,
     anti_mistouch_enable: AtomicBool,
     anti_mistouch_threshold: AtomicI32,
     anti_mistouch_count: AtomicI32,
     mistouch_reported: AtomicBool,
+}
+
+impl Drop for FodEngine {
+    fn drop(&mut self) {
+        if self.touch_wake_fd >= 0 {
+            unsafe { libc::close(self.touch_wake_fd) };
+        }
+        if self.evdev_wake_fd >= 0 {
+            unsafe { libc::close(self.evdev_wake_fd) };
+        }
+    }
+}
+
+fn new_wake_fd(name: &str) -> RawFd {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        loge!("fod=eventfd-error name={name} err={}", std::io::Error::last_os_error());
+    }
+    fd
+}
+
+fn signal_wake_fd(fd: RawFd) {
+    if fd >= 0 {
+        let val: u64 = 1;
+        let _ = unsafe {
+            libc::write(
+                fd,
+                &val as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
+
+fn drain_wake_fd(fd: RawFd) {
+    if fd < 0 {
+        return;
+    }
+    let mut val: u64 = 0;
+    loop {
+        let ret = unsafe {
+            libc::read(
+                fd,
+                &mut val as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if ret <= 0 {
+            break;
+        }
+    }
+}
+
+fn is_hal_active(hal_state: u32) -> bool {
+    matches!(hal_state, 1 | 3 | 5)
 }
 
 impl FodEngine {
@@ -71,10 +128,17 @@ impl FodEngine {
             hal::get_prop("persist.vendor.sys.fp.valid_times_per_screenlock")
                 .and_then(|value| value.into_bytes().first().map(|b| *b as i32 - b'0' as i32))
                 .unwrap_or(3);
+        let (touch_wake_fd, evdev_wake_fd) = if enabled {
+            (new_wake_fd("touch"), new_wake_fd("evdev"))
+        } else {
+            (-1, -1)
+        };
         Self {
             enabled,
             hal,
             hbm_file,
+            touch_wake_fd,
+            evdev_wake_fd,
             state: Mutex::new(State::default()),
             active: Condvar::new(),
             anti_mistouch_enable: AtomicBool::new(anti_mistouch_enable),
@@ -82,6 +146,21 @@ impl FodEngine {
             anti_mistouch_count: AtomicI32::new(0),
             mistouch_reported: AtomicBool::new(false),
         }
+    }
+
+    fn wake_monitors(&self) {
+        self.active.notify_all();
+        signal_wake_fd(self.touch_wake_fd);
+        signal_wake_fd(self.evdev_wake_fd);
+    }
+
+    fn is_active(&self) -> bool {
+        is_hal_active(
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hal_state,
+        )
     }
 
     pub fn start(hal: Option<Arc<Hal>>) -> Arc<Self> {
@@ -222,14 +301,32 @@ impl FodEngine {
                 self.hal_ext_cmd(14, param);
             }
             4 => {
-                let previous = {
+                let (previous, was_down, was_capturing) = {
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     let previous = state.hal_state;
                     state.hal_state = param;
-                    previous
+                    state.fp_mode = param;
+                    if !is_hal_active(param) {
+                        let was_down = state.touch_down;
+                        let was_capturing = state.capture;
+                        state.touch_down = false;
+                        state.capture = false;
+                        state.hbm_target = false;
+                        state.x = 0;
+                        state.y = 0;
+                        (previous, was_down, was_capturing)
+                    } else {
+                        (previous, false, false)
+                    }
                 };
-                self.active.notify_all();
+                self.wake_monitors();
                 logi!("hal prev={previous} next={param}");
+                if was_capturing {
+                    self.hal_ext_cmd(10, 0);
+                }
+                if was_down {
+                    self.hal_ext_cmd(1, 0);
+                }
                 match param {
                     1 | 3 => {
                         if self.hbm_on() {
@@ -241,7 +338,6 @@ impl FodEngine {
                     }
                     _ => {}
                 }
-                self.state.lock().unwrap_or_else(|e| e.into_inner()).fp_mode = param;
                 self.check_fod_touch_status();
             }
             6 | 7 | 8 => {
@@ -485,13 +581,18 @@ impl FodEngine {
         let start = value != 0 && ((value & 3) == 3 || (value & 8) != 0);
         let low_brightness = (value & 4) != 0;
         if start {
-            let (x, y, already) = {
+            let (x, y, already, active) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let already = state.capture;
-                state.capture = true;
-                (state.x, state.y, already)
+                let active = is_hal_active(state.hal_state);
+                if !active {
+                    (0, 0, true, false)
+                } else {
+                    let already = state.capture;
+                    state.capture = true;
+                    (state.x, state.y, already, true)
+                }
             };
-            if already {
+            if !active || already {
                 return;
             }
             logi!("sensor-capture=start low-light={low_brightness}");
@@ -557,21 +658,50 @@ impl FodEngine {
             unsafe { libc::close(epfd) };
             return;
         }
+        if self.touch_wake_fd >= 0 {
+            let mut wake_event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: self.touch_wake_fd as u64,
+            };
+            if unsafe {
+                libc::epoll_ctl(
+                    epfd,
+                    libc::EPOLL_CTL_ADD,
+                    self.touch_wake_fd,
+                    &mut wake_event,
+                )
+            } < 0
+            {
+                loge!(
+                    "sensor=epoll-wake-add-error err={}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         logi!("sensor=ready node={FOD_STATUS} epoll=1");
         let mut last = None;
         let mut buf = [0u8; 1];
         let mut last_error = false;
+        let mut events = [
+            libc::epoll_event { events: 0, u64: 0 },
+            libc::epoll_event { events: 0, u64: 0 },
+        ];
         loop {
             {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                while !matches!(state.hal_state, 1 | 3 | 5) {
+                while !is_hal_active(state.hal_state) {
                     last = None;
                     state = self.active.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
             }
+            drain_wake_fd(self.touch_wake_fd);
+            if !self.is_active() {
+                continue;
+            }
+            logd!("thread=touch state=on");
             self.read_fod_status(&file, &mut buf, &mut last, &mut last_error);
             loop {
-                let ret = unsafe { libc::epoll_wait(epfd, &mut event, 1, -1) };
+                let ret = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
                 if ret < 0 {
                     let e = std::io::Error::last_os_error();
                     if e.kind() == std::io::ErrorKind::Interrupted {
@@ -581,16 +711,25 @@ impl FodEngine {
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 }
-                self.read_fod_status(&file, &mut buf, &mut last, &mut last_error);
-                let active = matches!(
-                    self.state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .hal_state,
-                    1 | 3 | 5
-                );
-                if !active {
+                let mut woke = false;
+                let mut touch_evt = false;
+                for ev in &events[..ret as usize] {
+                    if self.touch_wake_fd >= 0 && ev.u64 == self.touch_wake_fd as u64 {
+                        woke = true;
+                    }
+                    if ev.u64 == file.as_raw_fd() as u64 {
+                        touch_evt = true;
+                    }
+                }
+                if woke {
+                    drain_wake_fd(self.touch_wake_fd);
+                }
+                if !self.is_active() {
+                    logd!("thread=touch state=off");
                     break;
+                }
+                if touch_evt {
+                    self.read_fod_status(&file, &mut buf, &mut last, &mut last_error);
                 }
             }
         }
@@ -781,85 +920,107 @@ impl FodEngine {
         logi!("evdev=ready path={path} scale={factor}");
         let mut buf = [0u8; 24 * 16];
         let mut raw_down = false;
-        let mut pfd = libc::pollfd {
-            fd: file.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut pfds = [
+            libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.evdev_wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds: libc::nfds_t = if self.evdev_wake_fd >= 0 { 2 } else { 1 };
         loop {
             {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                while !matches!(state.hal_state, 1 | 3 | 5) {
+                while !is_hal_active(state.hal_state) {
+                    raw_down = false;
                     state = self.active.wait(state).unwrap_or_else(|e| e.into_inner());
                 }
             }
-            pfd.revents = 0;
-            let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
-            if ret < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
+            drain_wake_fd(self.evdev_wake_fd);
+            // Discard stale input events buffered while FOD was disarmed.
+            while let Ok(n) = file.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            if !self.is_active() {
+                continue;
+            }
+            logd!("thread=evdev state=on");
+            loop {
+                pfds[0].revents = 0;
+                pfds[1].revents = 0;
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+                if ret < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    loge!("evdev=poll-error path={path} err={e}");
+                    thread::sleep(Duration::from_secs(1));
                     continue;
                 }
-                loge!("evdev=poll-error path={path} err={e}");
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-            if ret == 0 {
-                continue;
-            }
-            match file.read(&mut buf) {
-                Ok(0) => {
-                    logw!("evdev=eof path={path}");
-                    thread::sleep(Duration::from_secs(1));
+                if nfds == 2 && (pfds[1].revents & libc::POLLIN) != 0 {
+                    drain_wake_fd(self.evdev_wake_fd);
                 }
-                Ok(n) => {
-                    for event in buf[..n].chunks_exact(24) {
-                        let typ = u16::from_ne_bytes([event[16], event[17]]);
-                        let code = u16::from_ne_bytes([event[18], event[19]]);
-                        let value =
-                            i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
-                        if typ == 3 && (code == 0x35 || code == 0x36) && value > 0 {
-                            let value = value as u32 / factor;
-                            if value == 0 {
-                                continue;
-                            }
-                            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            if code == 0x35 {
-                                state.x = value;
-                            } else {
-                                state.y = value;
-                            }
-                        } else if typ == 1 && (code == 0x14a || code == 0x145) {
-                            if value == 1 {
-                                if !raw_down {
-                                    raw_down = true;
-                                    logd!("evdev=btn state=down");
+                if !self.is_active() {
+                    raw_down = false;
+                    logd!("thread=evdev state=off");
+                    break;
+                }
+                if ret == 0 || (pfds[0].revents & libc::POLLIN) == 0 {
+                    continue;
+                }
+                match file.read(&mut buf) {
+                    Ok(0) => {
+                        logw!("evdev=eof path={path}");
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    Ok(n) => {
+                        for event in buf[..n].chunks_exact(24) {
+                            let typ = u16::from_ne_bytes([event[16], event[17]]);
+                            let code = u16::from_ne_bytes([event[18], event[19]]);
+                            let value =
+                                i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
+                            if typ == 3 && (code == 0x35 || code == 0x36) && value > 0 {
+                                let value = value as u32 / factor;
+                                if value == 0 {
+                                    continue;
                                 }
-                            } else if value == 0 && raw_down {
-                                raw_down = false;
-                                logd!("evdev=btn state=up");
+                                let mut state =
+                                    self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                if code == 0x35 {
+                                    state.x = value;
+                                } else {
+                                    state.y = value;
+                                }
+                            } else if typ == 1 && (code == 0x14a || code == 0x145) {
+                                if value == 1 {
+                                    if !raw_down {
+                                        raw_down = true;
+                                        logd!("evdev=btn state=down");
+                                    }
+                                } else if value == 0 && raw_down {
+                                    raw_down = false;
+                                    logd!("evdev=btn state=up");
+                                }
                             }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        loge!("evdev=read-error path={path} err={e}");
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    loge!("evdev=read-error path={path} err={e}");
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-            let active = matches!(
-                self.state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .hal_state,
-                1 | 3 | 5
-            );
-            if !active {
-                break;
             }
         }
     }

@@ -424,6 +424,8 @@ fn dispatch_notify(daemon: &Arc<Daemon>, msg: &FingerprintMsg) {
             if remaining == 0 {
                 daemon.note_enrollment(enrollment_id);
                 daemon.set_global_status(GS_IDLE);
+                daemon.fod.reset("enroll-done");
+                crate::oplus_fingerprint::on_session_close();
             }
         }
         4 => {
@@ -1069,6 +1071,8 @@ impl CancellationTrait for CancellationSignal {
         crate::logi!("session=cancel");
         if self.daemon.global_status() == GS_IDLE {
             crate::logw!("session=cancel result=idle");
+            self.daemon.fod.reset("cancel-idle");
+            crate::oplus_fingerprint::on_cancelled();
             if let Some(cb) = self.daemon.callback() {
                 if let Err(e) = cb.onError(Error::CANCELED, 0) {
                     crate::logw!("callback=error result=invoke-error err={e:?}");

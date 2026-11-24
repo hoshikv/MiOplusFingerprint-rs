@@ -66,6 +66,7 @@ struct State {
     auth_done: bool,
     pending_down: bool,
     physical_down: bool,
+    armed: bool,
     unlock_switch: Option<bool>,
 }
 
@@ -78,6 +79,7 @@ impl Default for State {
             auth_done: false,
             pending_down: false,
             physical_down: false,
+            armed: false,
             unlock_switch: None,
         }
     }
@@ -162,7 +164,10 @@ impl OplusFingerprint {
             self.disarm_with("user-locked");
             return;
         }
-        let enrolling = state_lock(&self.state).operation == Operation::Enroll.code();
+        let (enrolling, already_armed) = {
+            let state = state_lock(&self.state);
+            (state.operation == Operation::Enroll.code(), state.armed)
+        };
         if !enrolling {
             if !self.unlock_switch_enabled() {
                 self.disarm_with("unlock-disabled");
@@ -173,6 +178,10 @@ impl OplusFingerprint {
                 return;
             }
         }
+        if already_armed {
+            return;
+        }
+        state_lock(&self.state).armed = true;
         let fod = self.daemon.fod();
         fod.on_ext_cmd(4, 1);
         fod.on_ext_cmd(1, 1);
@@ -184,6 +193,7 @@ impl OplusFingerprint {
     }
 
     fn disarm_with(&self, reason: &str) {
+        state_lock(&self.state).armed = false;
         crate::touchfeature::set_touch_mode(0);
         let fod = self.daemon.fod();
         fod.on_ext_cmd(4, 0);
@@ -210,19 +220,23 @@ impl OplusFingerprint {
     }
 
     fn touch_listener(&self) {
-        {
+        let should_arm = {
             let mut state = state_lock(&self.state);
             state.listener = true;
-            state.auth_done = false;
             state.pending_down = false;
             state.physical_down = false;
+            // Only arm immediately if an operation is active or the screen is off/doze (AOD/lockscreen).
+            // Never arm while unlocked on SCREEN_ON with no active biometric operation.
+            state.operation != 0 || state.screen_state != SCREEN_ON || !state.auth_done
+        };
+        if should_arm {
+            self.arm();
         }
-        self.arm();
-        logi!("listen=on");
+        logi!("listen=on armed={should_arm}");
     }
 
     fn screen_state(&self, value: i32) {
-        let reset_auth = {
+        let (reset_auth, should_arm, should_disarm) = {
             let mut state = state_lock(&self.state);
             let reset_auth =
                 state.screen_state == SCREEN_ON && (value == SCREEN_OFF || value == SCREEN_DOZE);
@@ -232,20 +246,34 @@ impl OplusFingerprint {
             }
             state.pending_down = false;
             state.physical_down = false;
-            reset_auth
+            let active_op = state.operation != 0;
+            let should_arm = active_op || (value != SCREEN_ON && state.listener);
+            let should_disarm = value == SCREEN_ON && !active_op && state.auth_done;
+            (reset_auth, should_arm, should_disarm)
         };
-        self.arm();
-        logi!("screen val={value} auth_reset={reset_auth}");
+        if should_arm {
+            self.arm();
+        } else if should_disarm {
+            self.disarm_with("screen-on-idle");
+        }
+        logi!("screen val={value} auth_reset={reset_auth} arm={should_arm} disarm={should_disarm}");
     }
 
     fn authenticate_type(&self, auth_type: i32) {
+        let should_arm = auth_type != 0;
         {
             let mut state = state_lock(&self.state);
-            state.auth_done = false;
+            if should_arm {
+                state.auth_done = false;
+            }
             state.pending_down = false;
             state.physical_down = false;
         }
-        self.arm();
+        if should_arm {
+            self.arm();
+        } else {
+            self.disarm_with("auth-type-zero");
+        }
         logi!("auth kind={auth_type}");
     }
 
@@ -361,8 +389,16 @@ impl OplusFingerprint {
     }
 
     fn panel_hbm_on(&self) {
-        self.arm();
-        logi!("highlight=on");
+        let allow = {
+            let state = state_lock(&self.state);
+            state.operation != 0 || state.screen_state != SCREEN_ON || !state.auth_done
+        };
+        if allow {
+            self.arm();
+            logi!("highlight=on");
+        } else {
+            logi!("highlight=skip reason=unlocked-idle");
+        }
     }
 }
 
