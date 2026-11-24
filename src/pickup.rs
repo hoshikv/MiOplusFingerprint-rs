@@ -256,6 +256,7 @@ pub fn run_helper() {
     logi!("native-pickup sensor=ready handle={handle} type={PICKUP_TYPE}");
 
     let mut last = Instant::now() - WAKE_DEBOUNCE;
+    let mut empty_polls: u32 = 0;
     loop {
         let ident =
             unsafe { (api.looper_poll)(-1, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
@@ -265,12 +266,19 @@ pub fn run_helper() {
             continue;
         }
 
+        let mut got_event = false;
+        let mut read_err = false;
         loop {
             let mut event: ASensorEvent = unsafe { std::mem::zeroed() };
             let count = unsafe { (api.get_events)(queue, &mut event, 1) };
-            if count <= 0 {
+            if count < 0 {
+                read_err = true;
                 break;
             }
+            if count == 0 {
+                break;
+            }
+            got_event = true;
             if event.type_ == PICKUP_TYPE {
                 if event.data[0] != 1.0 {
                     logi!("native-pickup ignore data0={:.1}", event.data[0]);
@@ -282,6 +290,21 @@ pub fn run_helper() {
                     on_pickup();
                 }
             }
+        }
+
+        if read_err {
+            logw!("native-pickup sensor=read-error reconnect");
+            return;
+        }
+        if got_event {
+            empty_polls = 0;
+        } else {
+            empty_polls = empty_polls.saturating_add(1);
+            if empty_polls >= 5 {
+                logw!("native-pickup sensor=disconnected reconnect");
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -404,6 +427,10 @@ fn run_single_tap_monitor() {
             logw!("single-tap evdev=poll-error path={path} err={e}");
             thread::sleep(Duration::from_secs(1));
             continue;
+        }
+        if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+            logw!("single-tap evdev=hangup path={path}");
+            return;
         }
         if ret == 0 || (pfd.revents & libc::POLLIN) == 0 {
             continue;
