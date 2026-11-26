@@ -8,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -121,6 +122,12 @@ const PACKAGE: &str = "com.hoshikv.mfpdaemon";
 const WAKE_KEYCODE: &str = "224";
 const AOD_GESTURE_KEYCODE: &str = "134";
 const BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/panel0-backlight/brightness";
+const WAKE_LOCK_PATH: &str = "/sys/power/wake_lock";
+const WAKE_UNLOCK_PATH: &str = "/sys/power/wake_unlock";
+const WAKE_LOCK_NAME: &str = "mfp_aod_wake";
+const WAKE_LOCK_TIMEOUT_NS: u64 = 2_000_000_000;
+const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(10);
+const EMPTY_POLL_SPIN_WINDOW: Duration = Duration::from_secs(1);
 const EV_KEY: u16 = 1;
 const KEY_GOTO: u16 = 0x0162;
 const SINGLE_TAP_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -128,6 +135,14 @@ const EVENT_RATE_US: c_int = 1_000_000;
 const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
 const ALOOPER_POLL_ERROR: c_int = -4;
+
+struct CachedSettings {
+    wake: bool,
+    aod: bool,
+    updated_at: Instant,
+}
+
+static SETTINGS_CACHE: Mutex<Option<CachedSettings>> = Mutex::new(None);
 
 #[repr(C)]
 struct ASensorEvent {
@@ -257,6 +272,8 @@ pub fn run_helper() {
 
     let mut last = Instant::now() - WAKE_DEBOUNCE;
     let mut empty_polls: u32 = 0;
+    let mut last_empty_poll: Option<Instant> = None;
+    let _ = get_settings();
     loop {
         let ident =
             unsafe { (api.looper_poll)(-1, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
@@ -298,8 +315,18 @@ pub fn run_helper() {
         }
         if got_event {
             empty_polls = 0;
+            last_empty_poll = None;
         } else {
-            empty_polls = empty_polls.saturating_add(1);
+            let now = Instant::now();
+            if last_empty_poll
+                .map(|prev| now.duration_since(prev) <= EMPTY_POLL_SPIN_WINDOW)
+                .unwrap_or(false)
+            {
+                empty_polls = empty_polls.saturating_add(1);
+            } else {
+                empty_polls = 1;
+            }
+            last_empty_poll = Some(now);
             if empty_polls >= 5 {
                 logw!("native-pickup sensor=disconnected reconnect");
                 return;
@@ -309,20 +336,38 @@ pub fn run_helper() {
     }
 }
 
+fn acquire_wake_lock() {
+    let payload = format!("{WAKE_LOCK_NAME} {WAKE_LOCK_TIMEOUT_NS}\n");
+    if let Err(e) = fs::write(WAKE_LOCK_PATH, payload) {
+        logw!("native-pickup wake_lock=error err={e}");
+    }
+}
+
+fn release_wake_lock() {
+    let _ = fs::write(WAKE_UNLOCK_PATH, format!("{WAKE_LOCK_NAME}\n"));
+}
+
 fn on_pickup() {
-    if wake_enabled() {
+    // Hold a short kernel-timed wakelock so s2idle autosleep cannot freeze us
+    // before settings/input complete. Released immediately if skipped.
+    acquire_wake_lock();
+
+    let (wake, aod) = get_settings();
+    if wake {
         logi!("native-pickup trigger wake=key");
         send_keyevent(WAKE_KEYCODE, "wake");
         return;
     }
 
-    if !aod_enabled() {
+    if !aod {
         logi!("native-pickup trigger wake=disabled aod=disabled");
+        release_wake_lock();
         return;
     }
 
     if !is_screen_off() {
         logi!("native-pickup trigger wake=disabled aod=skip-screen-on");
+        release_wake_lock();
         return;
     }
 
@@ -342,6 +387,27 @@ fn send_keyevent(keycode: &str, label: &str) {
         Ok(status) => logw!("native-pickup {label}=fail status={status}"),
         Err(e) => logw!("native-pickup {label}=error err={e}"),
     }
+}
+
+fn get_settings() -> (bool, bool) {
+    if let Ok(guard) = SETTINGS_CACHE.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.updated_at.elapsed() < SETTINGS_CACHE_TTL {
+                return (cached.wake, cached.aod);
+            }
+        }
+    }
+
+    let wake = wake_enabled();
+    let aod = aod_enabled();
+    if let Ok(mut guard) = SETTINGS_CACHE.lock() {
+        *guard = Some(CachedSettings {
+            wake,
+            aod,
+            updated_at: Instant::now(),
+        });
+    }
+    (wake, aod)
 }
 
 fn wake_enabled() -> bool {
@@ -407,32 +473,62 @@ fn run_single_tap_monitor() {
         }
     }
 
-    logi!("single-tap evdev=ready path={path} key={KEY_GOTO:#x}");
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        logw!(
+            "single-tap epoll=create-error path={path} err={}",
+            io::Error::last_os_error()
+        );
+        return;
+    }
 
-    let mut pfd = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
+    let mut ev = libc::epoll_event {
+        events: (libc::EPOLLIN | libc::EPOLLWAKEUP) as u32,
+        u64: file.as_raw_fd() as u64,
     };
+    let mut wakeup_armed = true;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, file.as_raw_fd(), &mut ev) } < 0 {
+        wakeup_armed = false;
+        ev.events = libc::EPOLLIN as u32;
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, file.as_raw_fd(), &mut ev) } < 0 {
+            logw!(
+                "single-tap epoll=add-error path={path} err={}",
+                io::Error::last_os_error()
+            );
+            unsafe { libc::close(epfd) };
+            return;
+        }
+    }
+
+    logi!(
+        "single-tap evdev=ready path={path} key={KEY_GOTO:#x} epoll_wakeup={wakeup_armed}"
+    );
+
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
     let mut last = Instant::now() - SINGLE_TAP_DEBOUNCE;
 
     loop {
-        pfd.revents = 0;
-        let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let ret = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as c_int, -1) };
         if ret < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            logw!("single-tap evdev=poll-error path={path} err={e}");
+            logw!("single-tap evdev=epoll-error path={path} err={e}");
             thread::sleep(Duration::from_secs(1));
             continue;
         }
-        if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+        if ret == 0 {
+            continue;
+        }
+
+        let revents = events[0].events as i32;
+        if (revents & (libc::EPOLLERR | libc::EPOLLHUP)) != 0 {
             logw!("single-tap evdev=hangup path={path}");
+            unsafe { libc::close(epfd) };
             return;
         }
-        if ret == 0 || (pfd.revents & libc::POLLIN) == 0 {
+        if (revents & libc::EPOLLIN) == 0 {
             continue;
         }
 
@@ -467,13 +563,19 @@ fn run_single_tap_monitor() {
 }
 
 fn on_single_tap() {
-    if !aod_enabled() {
-        logi!("single-tap trigger aod=disabled");
+    if !is_screen_off() {
+        logi!("single-tap trigger aod=skip-screen-on");
         return;
     }
 
-    if !is_screen_off() {
-        logi!("single-tap trigger aod=skip-screen-on");
+    // Hold a short kernel-timed wakelock so s2idle autosleep cannot freeze us
+    // before settings/input complete. Released immediately if AOD is disabled.
+    acquire_wake_lock();
+
+    let (_, aod) = get_settings();
+    if !aod {
+        logi!("single-tap trigger aod=disabled");
+        release_wake_lock();
         return;
     }
 
