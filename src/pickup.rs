@@ -50,10 +50,15 @@ fn run() {
                 continue;
             }
         };
+        let spawned_at = Instant::now();
         match wait_for_exit(&mut child) {
             Ok(status) => {
                 logw!("native-pickup helper=exit status={status}");
-                retry = RETRY_MIN;
+                if spawned_at.elapsed() >= Duration::from_secs(60) {
+                    retry = RETRY_MIN;
+                } else {
+                    retry = (retry * 2).min(RETRY_MAX);
+                }
             }
             Err(e) => {
                 logw!("native-pickup helper=wait-error err={e} path={HELPER}");
@@ -122,6 +127,7 @@ const PACKAGE: &str = "com.hoshikv.mfpdaemon";
 const WAKE_KEYCODE: &str = "224";
 const AOD_GESTURE_KEYCODE: &str = "134";
 const BACKLIGHT_BRIGHTNESS: &str = "/sys/class/backlight/panel0-backlight/brightness";
+const DOZE_BRIGHTNESS: &str = "/sys/class/mi_display/disp-DSI-0/doze_brightness";
 const WAKE_LOCK_PATH: &str = "/sys/power/wake_lock";
 const WAKE_UNLOCK_PATH: &str = "/sys/power/wake_unlock";
 const WAKE_LOCK_NAME: &str = "mfp_aod_wake";
@@ -134,7 +140,12 @@ const SINGLE_TAP_DEBOUNCE: Duration = Duration::from_millis(500);
 const EVENT_RATE_US: c_int = 1_000_000;
 const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
+const ALOOPER_POLL_WAKE: c_int = -1;
+const ALOOPER_POLL_CALLBACK: c_int = -2;
+const ALOOPER_POLL_TIMEOUT: c_int = -3;
 const ALOOPER_POLL_ERROR: c_int = -4;
+const ALOOPER_EVENT_ERROR: c_int = 1 << 2;
+const ALOOPER_EVENT_HANGUP: c_int = 1 << 3;
 
 struct CachedSettings {
     wake: bool,
@@ -275,12 +286,25 @@ pub fn run_helper() {
     let mut last_empty_poll: Option<Instant> = None;
     let _ = get_settings();
     loop {
-        let ident =
-            unsafe { (api.looper_poll)(-1, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
+        let mut out_events: c_int = 0;
+        let ident = unsafe {
+            (api.looper_poll)(-1, ptr::null_mut(), &mut out_events, ptr::null_mut())
+        };
         if ident == ALOOPER_POLL_ERROR {
             logw!("native-pickup sensor=poll-error");
             thread::sleep(Duration::from_secs(1));
             continue;
+        }
+        if ident == ALOOPER_POLL_WAKE
+            || ident == ALOOPER_POLL_CALLBACK
+            || ident == ALOOPER_POLL_TIMEOUT
+        {
+            // Normal looper wakeup / suspend EINTR — never treat as sensor disconnect.
+            continue;
+        }
+        if (out_events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) != 0 {
+            logw!("native-pickup sensor=hangup events={out_events:#x} reconnect");
+            return;
         }
 
         let mut got_event = false;
@@ -327,8 +351,10 @@ pub fn run_helper() {
                 empty_polls = 1;
             }
             last_empty_poll = Some(now);
-            if empty_polls >= 5 {
-                logw!("native-pickup sensor=disconnected reconnect");
+            if empty_polls >= 20 {
+                logw!(
+                    "native-pickup sensor=disconnected ident={ident} events={out_events:#x} reconnect"
+                );
                 return;
             }
             thread::sleep(Duration::from_millis(50));
@@ -373,6 +399,29 @@ fn on_pickup() {
 
     logi!("native-pickup trigger wake=disabled aod=key");
     send_keyevent(AOD_GESTURE_KEYCODE, "aod");
+    ensure_aod_doze_brightness();
+}
+
+fn ensure_aod_doze_brightness() {
+    // Non-1Hz AOD themes (e.g. Workshop/Wallpaper AOD) do not call feature 195
+    // (enableLTPOAod), leaving Xiaomi's panel doze_brightness at 0 in DOZE.
+    // Wait briefly for DreamService -> mi_disp DOZE transition, then apply
+    // doze_brightness if still 0 while screen backlight is off.
+    let _ = thread::Builder::new()
+        .name("aod-doze-guard".into())
+        .spawn(|| {
+            thread::sleep(Duration::from_millis(350));
+            if !is_screen_off() {
+                return;
+            }
+            let doze_bl = fs::read_to_string(DOZE_BRIGHTNESS)
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            if doze_bl == 0 {
+                crate::xiaomi_display::aod_doze();
+            }
+        });
 }
 
 fn send_keyevent(keycode: &str, label: &str) {
@@ -581,6 +630,7 @@ fn on_single_tap() {
 
     logi!("single-tap trigger aod=key");
     send_keyevent(AOD_GESTURE_KEYCODE, "single-tap-aod");
+    ensure_aod_doze_brightness();
 }
 
 fn find_touch_event_path() -> Option<String> {
